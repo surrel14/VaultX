@@ -1,0 +1,53 @@
+name: VaultX
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    iOS: "16.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Manual
+targets:
+  VaultX:
+    type: application
+    platform: iOS
+    sources:
+      - path: VaultX
+    resources:
+      - path: VaultX/Resources
+    entitlements:
+      path: VaultX/VaultX.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.VaultX
+        INFOPLIST_FILE: VaultX/Info.plist
+        PRODUCT_NAME: VaultX
+    dependencies:
+      - target: VaultXFileProvider
+
+  VaultXFileProvider:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: VaultXFileProvider
+    entitlements:
+      path: VaultXFileProvider/VaultXFileProvider.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.VaultX.FileProvider
+        INFOPLIST_FILE: VaultXFileProvider/Info.plist
+        PRODUCT_NAME: VaultXFileProvider
+
+  VaultXTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: VaultXTests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.VaultXTests
+        GENERATE_INFOPLIST_FILE: YES
+    dependencies:
+      - target: VaultX

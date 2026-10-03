@@ -1,0 +1,12 @@
+.DS_Store
+.build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcodeproj/xcuserdata/
+.env
+*.mobileprovision
+*.p12
+*.cer
+fastlane/report.xml
+fastlane/Preview.html
