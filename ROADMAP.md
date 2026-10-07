@@ -10,6 +10,18 @@
 - [x] Face ID Keychain unlock foundation
 - [x] GitHub Actions build/test
 
+## v0.2.5 — Local vault usability
+
+- [x] Folders (create, browse, rename, move, delete)
+- [x] Delete with confirmation and best-effort secure overwrite
+- [x] Rename files
+- [x] Quick Look preview, in-RAM thumbnails (images, PDF)
+- [x] Export through the share sheet
+- [x] Sorting and search
+- [x] Auto-lock (background / inactivity) and privacy cover
+- [x] Face ID / Touch ID unlock through the Keychain
+- [x] Master key wiped from memory on lock
+
 ## v0.3 — File Provider
 
 - [ ] Expose the active vault in Files.app

@@ -1,282 +1,444 @@
 import SwiftUI
-import UniformTypeIdentifiers
 
-struct ContentView: View {
-    @State private var vaults: [URL] = []
-    @State private var showingCreate = false
-    @State private var selectedVault: URL?
-    @State private var message: String?
+// MARK: - Navigation helpers
 
-    var body: some View {
-        NavigationStack {
-            Group {
-                if vaults.isEmpty {
-                    ContentUnavailableView {
-                        Label("Nessun vault", systemImage: "lock.doc")
-                    } description: {
-                        Text("Crea un vault cifrato per proteggere i tuoi file.")
-                    } actions: {
-                        Button("Crea vault") { showingCreate = true }
-                    }
-                } else {
-                    List(vaults, id: \.self) { vault in
-                        Button {
-                            selectedVault = vault
-                        } label: {
-                            HStack(spacing: 14) {
-                                Image(systemName: "lock.fill")
-                                    .font(.title3)
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(vault.lastPathComponent)
-                                        .font(.headline)
-                                    Text("Vault cifrato")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-            .navigationTitle("VaultX")
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button { showingCreate = true } label: {
-                        Image(systemName: "plus")
-                    }
-                    .accessibilityLabel("Crea vault")
-                }
-            }
-            .task { loadVaults() }
-            .sheet(isPresented: $showingCreate) {
-                CreateVaultView(onCreated: loadVaults)
-            }
-            .sheet(item: Binding(
-                get: { selectedVault.map(VaultURLItem.init) },
-                set: { selectedVault = $0?.url }
-            )) { item in
-                UnlockVaultView(vaultURL: item.url)
-            }
-            .alert("VaultX", isPresented: Binding(
-                get: { message != nil },
-                set: { if !$0 { message = nil } }
-            )) {
-                Button("OK") { message = nil }
-            } message: {
-                Text(message ?? "")
-            }
-        }
-    }
-
-    private func loadVaults() {
-        do {
-            vaults = try VaultStore.shared.vaults()
-        } catch {
-            message = error.localizedDescription
-        }
-    }
-}
-
-private struct VaultURLItem: Identifiable {
+/// Wrapper Identifiable per presentare lo sheet di sblocco con `.sheet(item:)`.
+struct VaultSelection: Identifiable {
     let url: URL
     var id: URL { url }
 }
 
-private struct CreateVaultView: View {
-    @Environment(\.dismiss) private var dismiss
-    @State private var name = ""
-    @State private var password = ""
-    @State private var confirmPassword = ""
-    @State private var enableFaceID = true
-    @State private var error: String?
-    let onCreated: () -> Void
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section("Vault") {
-                    TextField("Nome", text: $name)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                }
-                Section("Password") {
-                    SecureField("Password", text: $password)
-                    SecureField("Ripeti password", text: $confirmPassword)
-                    Text("La password deve contenere almeno 8 caratteri.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Section {
-                    Toggle("Usa Face ID per lo sblocco", isOn: $enableFaceID)
-                } footer: {
-                    Text("La chiave del vault resta protetta dal Keychain del dispositivo.")
-                }
-                if let error {
-                    Section { Text(error).foregroundStyle(.red) }
-                }
-                Section {
-                    Button("Crea vault") { create() }
-                        .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || password.count < 8 || password != confirmPassword)
-                }
-            }
-            .navigationTitle("Nuovo vault")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Annulla") { dismiss() }
-                }
-            }
-        }
-    }
-
-    private func create() {
-        do {
-            let url = try VaultStore.shared.createVault(named: name, password: password)
-            if enableFaceID {
-                let session = try VaultStore.shared.unlockVault(at: url, password: password)
-                let access = try KeychainStore.makeBiometricAccessControl()
-                try KeychainStore.save(session.masterKeyForKeychain, account: "vault.\(url.lastPathComponent)", accessControl: access)
-            }
-            onCreated()
-            dismiss()
-        } catch {
-            self.error = error.localizedDescription
-        }
-    }
+/// Valore di navigazione per le sottocartelle di un vault aperto.
+struct VaultFolder: Hashable {
+    let url: URL
 }
 
-private struct UnlockVaultView: View {
-    @Environment(\.dismiss) private var dismiss
-    let vaultURL: URL
-    @State private var password = ""
-    @State private var session: VaultSession?
-    @State private var error: String?
-    @State private var isUnlocking = false
-    @State private var files: [URL] = []
-    @State private var showingImporter = false
+// MARK: - ContentView
+
+struct ContentView: View {
+
+    @Environment(\.scenePhase)
+    private var scenePhase
+
+    @AppStorage(AppSettings.backgroundLockKey)
+    private var backgroundLockSeconds = AppSettings.defaultBackgroundLockSeconds
+
+    @AppStorage(AppSettings.inactivityLockKey)
+    private var inactivityLockSeconds = AppSettings.defaultInactivityLockSeconds
+
+    @State private var vaults: [URL] = []
+    @State private var biometricVaults: Set<URL> = []
+
+    @State private var activeSession: VaultSession?
+    @State private var path: [VaultFolder] = []
+
+    @State private var unlockTarget: VaultSelection?
+    @State private var showingCreateVault = false
+    @State private var showingSettings = false
+
+    @State private var vaultPendingDeletion: URL?
+    @State private var showingVaultDeleteConfirm = false
+
+    @State private var backgroundedAt: Date?
+
+    @State private var errorMessage: String?
+    @State private var showingError = false
 
     var body: some View {
-        NavigationStack {
-            Group {
-                if let session {
-                    VaultFilesView(session: session, files: files, refresh: refresh, importFile: { showingImporter = true })
-                } else {
-                    unlockForm
+
+        NavigationStack(path: $path) {
+
+            root
+                .navigationDestination(for: VaultFolder.self) { folder in
+
+                    if let session = activeSession {
+
+                        VaultBrowserView(
+                            session: session,
+                            directory: folder.url,
+                            title: folder.url.lastPathComponent,
+                            onLock: { lockVault() }
+                        )
+                    }
                 }
+        }
+        .overlay {
+            privacyCover
+        }
+        .background {
+            presentations
+        }
+        .onAppear {
+            loadVaults()
+        }
+        .onChange(of: scenePhase) { phase in
+            handleScenePhase(phase)
+        }
+        .onChange(of: activeSession?.vaultURL) { url in
+
+            if url != nil {
+                startInactivityMonitor()
+            } else {
+                InactivityMonitor.shared.stop()
             }
-            .navigationTitle(vaultURL.lastPathComponent)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Chiudi") { dismiss() }
-                }
-            }
-            .fileImporter(
-                isPresented: $showingImporter,
-                allowedContentTypes: [.item],
-                allowsMultipleSelection: true
-            ) { result in
-                importFiles(result)
-            }
-            .task { await tryBiometricUnlock() }
         }
     }
 
-    private var unlockForm: some View {
-        Form {
-            Section("Sblocco") {
-                SecureField("Password", text: $password)
-                    .textContentType(.password)
+    // MARK: - Root
+
+    @ViewBuilder
+    private var root: some View {
+
+        if let session = activeSession {
+
+            VaultBrowserView(
+                session: session,
+                directory: session.rootDirectory,
+                title: session.manifest.name,
+                onLock: { lockVault() }
+            )
+
+        } else {
+
+            vaultListScreen
+        }
+    }
+
+    private var vaultListScreen: some View {
+
+        Group {
+
+            if vaults.isEmpty {
+                emptyState
+            } else {
+                vaultList
+            }
+        }
+        .navigationTitle("VaultX")
+        .toolbar {
+
+            ToolbarItem(placement: .navigationBarLeading) {
+
                 Button {
-                    unlockWithPassword()
+                    showingSettings = true
                 } label: {
-                    if isUnlocking { ProgressView() } else { Text("Sblocca") }
+                    Image(systemName: "gearshape")
                 }
-                .disabled(password.isEmpty || isUnlocking)
+                .accessibilityLabel("Impostazioni")
             }
-            if let error {
-                Section { Text(error).foregroundStyle(.red) }
+
+            ToolbarItem(placement: .navigationBarTrailing) {
+
+                Button {
+                    showingCreateVault = true
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .accessibilityLabel("Nuovo vault")
             }
         }
     }
 
-    private func unlockWithPassword() {
-        isUnlocking = true
-        defer { isUnlocking = false }
-        do {
-            let unlocked = try VaultStore.shared.unlockVault(at: vaultURL, password: password)
-            session = unlocked
-            refresh()
-        } catch {
-            self.error = error.localizedDescription
-        }
-    }
+    private var emptyState: some View {
 
-    private func tryBiometricUnlock() async {
-        let account = "vault.\(vaultURL.lastPathComponent)"
-        guard (try? KeychainStore.load(account: account)) != nil else { return }
-        do {
-            guard try await BiometricAuth.shared.authenticate(reason: "Sblocca il vault \(vaultURL.lastPathComponent)") else { return }
-            guard let masterKey = try KeychainStore.load(account: account) else { return }
-            let encryptedManifest = try Data(contentsOf: vaultURL.appendingPathComponent("vault.manifest"))
-            let manifestData = try VaultCrypto.decrypt(encryptedManifest, using: masterKey)
-            let manifest = try JSONDecoder().decode(VaultManifest.self, from: manifestData)
-            session = VaultSession(vaultURL: vaultURL, manifest: manifest, masterKey: masterKey)
-            refresh()
-        } catch {
-            // Fall back to password unlock without presenting a second error.
-        }
-    }
+        VStack(spacing: 18) {
 
-    private func refresh() {
-        guard let session else { return }
-        files = (try? session.encryptedFiles()) ?? []
-    }
+            Image(systemName: "lock.shield")
+                .font(.system(size: 64))
+                .foregroundStyle(.secondary)
 
-    private func importFiles(_ result: Result<[URL], Error>) {
-        guard let session else { return }
-        do {
-            for source in try result.get() {
-                let accessed = source.startAccessingSecurityScopedResource()
-                defer { if accessed { source.stopAccessingSecurityScopedResource() } }
-                _ = try session.encryptFile(at: source)
+            Text("Nessun vault")
+                .font(.title2.weight(.semibold))
+
+            Text("Crea un vault protetto da password per cifrare i tuoi file.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 32)
+
+            Button {
+                showingCreateVault = true
+            } label: {
+                Label("Crea vault", systemImage: "plus")
             }
-            refresh()
-        } catch {
-            self.error = error.localizedDescription
+            .buttonStyle(.borderedProminent)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
-}
 
-private struct VaultFilesView: View {
-    let session: VaultSession
-    let files: [URL]
-    let refresh: () -> Void
-    let importFile: () -> Void
-    @State private var error: String?
+    private var vaultList: some View {
 
-    var body: some View {
         List {
-            Section {
-                Button { importFile() } label: {
-                    Label("Importa file", systemImage: "plus")
+
+            ForEach(vaults, id: \.self) { vault in
+
+                Button {
+                    unlockTarget = VaultSelection(url: vault)
+                } label: {
+                    VaultRow(
+                        url: vault,
+                        hasBiometrics: biometricVaults.contains(vault)
+                    )
                 }
-            }
-            Section("File cifrati") {
-                if files.isEmpty {
-                    Text("Il vault è vuoto.")
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(files, id: \.self) { file in
-                        Label(displayName(file), systemImage: "doc.lock.fill")
+                .buttonStyle(.plain)
+                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+
+                    Button(role: .destructive) {
+                        vaultPendingDeletion = vault
+                        showingVaultDeleteConfirm = true
+                    } label: {
+                        Label("Elimina", systemImage: "trash")
                     }
                 }
             }
         }
-        .refreshable { refresh() }
+        .listStyle(.insetGrouped)
     }
 
-    private func displayName(_ url: URL) -> String {
-        let name = url.deletingPathExtension().lastPathComponent
-        return name.isEmpty ? url.lastPathComponent : name
+    // MARK: - Presentations
+
+    private var presentations: some View {
+
+        ZStack {
+
+            Color.clear
+                .sheet(isPresented: $showingCreateVault) {
+
+                    CreateVaultView {
+                        loadVaults()
+                    }
+                }
+
+            Color.clear
+                .sheet(isPresented: $showingSettings) {
+                    SettingsView()
+                }
+
+            Color.clear
+                .sheet(item: $unlockTarget) { target in
+
+                    NavigationStack {
+
+                        UnlockVaultView(vaultURL: target.url) { session in
+                            activeSession = session
+                            unlockTarget = nil
+                        }
+                    }
+                }
+
+            Color.clear
+                .alert(
+                    "Eliminare il vault?",
+                    isPresented: $showingVaultDeleteConfirm
+                ) {
+
+                    Button("Elimina", role: .destructive) {
+                        deletePendingVault()
+                    }
+
+                    Button("Annulla", role: .cancel) {}
+
+                } message: {
+
+                    Text("«\(vaultPendingDeletion?.lastPathComponent ?? "")» e tutti i file cifrati al suo interno verranno eliminati definitivamente. L'operazione non può essere annullata.")
+                }
+
+            Color.clear
+                .alert(
+                    "Errore",
+                    isPresented: $showingError
+                ) {
+                    Button("OK", role: .cancel) {}
+                } message: {
+                    Text(errorMessage ?? "")
+                }
+        }
+        .allowsHitTesting(false)
+    }
+
+    /// Copre l'interfaccia quando l'app non è attiva (app switcher,
+    /// centro di controllo...) per non mostrare i file negli snapshot di iOS.
+    @ViewBuilder
+    private var privacyCover: some View {
+
+        if activeSession != nil, scenePhase != .active {
+
+            ZStack {
+
+                Color(.systemBackground)
+                    .ignoresSafeArea()
+
+                VStack(spacing: 12) {
+
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 44))
+
+                    Text("Vault protetto")
+                        .font(.headline)
+                }
+                .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    // MARK: - Vaults
+
+    private func loadVaults() {
+
+        do {
+
+            let list = try VaultStore.shared.vaults()
+
+            vaults = list
+
+            biometricVaults = Set(
+                list.filter {
+                    VaultStore.shared.isBiometricUnlockEnabled(for: $0)
+                }
+            )
+
+        } catch {
+
+            errorMessage = error.localizedDescription
+            showingError = true
+        }
+    }
+
+    private func deletePendingVault() {
+
+        guard let url = vaultPendingDeletion else {
+            return
+        }
+
+        Task { @MainActor in
+
+            do {
+
+                try await Task.detached(
+                    priority: .userInitiated
+                ) {
+                    try VaultStore.shared.deleteVault(at: url)
+                }.value
+
+            } catch {
+
+                errorMessage = error.localizedDescription
+                showingError = true
+            }
+
+            loadVaults()
+        }
+    }
+
+    // MARK: - Lock
+
+    /// Blocca il vault: azzera la chiave in memoria, elimina le copie in chiaro
+    /// e torna alla lista dei vault.
+    private func lockVault() {
+
+        InactivityMonitor.shared.stop()
+
+        activeSession?.lock()
+
+        path.removeAll()
+        activeSession = nil
+        backgroundedAt = nil
+
+        loadVaults()
+    }
+
+    private func handleScenePhase(_ phase: ScenePhase) {
+
+        guard activeSession != nil else {
+            backgroundedAt = nil
+            return
+        }
+
+        switch phase {
+
+        case .background:
+
+            if backgroundLockSeconds == 0 {
+
+                lockVault()
+
+            } else if backgroundLockSeconds > 0 {
+
+                backgroundedAt = Date()
+            }
+
+        case .active:
+
+            if let since = backgroundedAt,
+               backgroundLockSeconds > 0,
+               Date().timeIntervalSince(since) >= TimeInterval(backgroundLockSeconds) {
+
+                lockVault()
+            }
+
+            backgroundedAt = nil
+
+        default:
+            break
+        }
+    }
+
+    private func startInactivityMonitor() {
+
+        InactivityMonitor.shared.start(
+            timeout: TimeInterval(inactivityLockSeconds)
+        ) {
+            lockVault()
+        }
+    }
+}
+
+// MARK: - Vault Row
+
+private struct VaultRow: View {
+
+    let url: URL
+    let hasBiometrics: Bool
+
+    var body: some View {
+
+        HStack(spacing: 14) {
+
+            Image(systemName: "lock.fill")
+                .font(.title3)
+                .foregroundStyle(.white)
+                .frame(width: 44, height: 44)
+                .background(
+                    Color.accentColor.gradient,
+                    in: RoundedRectangle(
+                        cornerRadius: 10,
+                        style: .continuous
+                    )
+                )
+
+            VStack(alignment: .leading, spacing: 3) {
+
+                Text(url.lastPathComponent)
+                    .font(.headline)
+
+                Text("Vault cifrato")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            if hasBiometrics {
+
+                Image(systemName: BiometricAuth.shared.systemImage)
+                    .foregroundStyle(.secondary)
+            }
+
+            Image(systemName: "chevron.right")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.vertical, 4)
+        .contentShape(Rectangle())
     }
 }

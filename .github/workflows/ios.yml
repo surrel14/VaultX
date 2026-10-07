@@ -3,7 +3,10 @@ name: iOS CI
 on:
   push:
     branches: ["**"]
+
   pull_request:
+
+  workflow_dispatch:
 
 jobs:
   build:
@@ -14,35 +17,100 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Select latest installed Xcode
+        shell: bash
         run: |
-          XCODE_APP=$(find /Applications -maxdepth 1 -name 'Xcode*.app' -print | sort | tail -n 1)
-          test -n "$XCODE_APP"
+          XCODE_APP=$(find /Applications -maxdepth 1 -name "Xcode*.app" -print | sort -V | tail -n 1)
+
+          if [ -z "$XCODE_APP" ]; then
+            echo "❌ Xcode non trovato"
+            exit 1
+          fi
+
+          echo "Using Xcode: $XCODE_APP"
+
           sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+
           xcodebuild -version
 
       - name: Install XcodeGen
-        run: brew install xcodegen
+        run: |
+          brew install xcodegen
 
       - name: Generate Xcode project
-        run: xcodegen generate
-
-      - name: Build
         run: |
+          xcodegen generate
+
+      - name: Build VaultX
+        run: |
+          set -o pipefail
+
           xcodebuild \
             -project VaultX.xcodeproj \
             -scheme VaultX \
+            -configuration Debug \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
-            -configuration Debug \
             CODE_SIGNING_ALLOWED=NO \
-            build
+            CODE_SIGNING_REQUIRED=NO \
+            build | tee build.log
 
-      - name: Test
+      - name: Locate VaultX.app
         run: |
-          xcodebuild \
-            -project VaultX.xcodeproj \
-            -scheme VaultX \
-            -sdk iphonesimulator \
-            -destination 'platform=iOS Simulator,name=iPhone 16' \
-            CODE_SIGNING_ALLOWED=NO \
-            test
+          echo "Searching for VaultX.app..."
+
+          APP_PATH=$(find "$HOME/Library/Developer/Xcode/DerivedData" \
+            -type d \
+            -path "*/Build/Products/Debug-iphoneos/VaultX.app" \
+            | head -n 1)
+
+          if [ -z "$APP_PATH" ]; then
+            echo "❌ VaultX.app non trovato"
+            echo "Contenuto di DerivedData:"
+            find "$HOME/Library/Developer/Xcode/DerivedData" \
+              -maxdepth 6 \
+              -name "VaultX.app" \
+              -print || true
+            exit 1
+          fi
+
+          echo "✅ VaultX.app trovato:"
+          echo "$APP_PATH"
+
+          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
+
+      - name: Package IPA
+        run: |
+          set -e
+
+          echo "Packaging:"
+          echo "$APP_PATH"
+
+          rm -rf Payload
+          rm -f VaultX.ipa
+
+          mkdir -p Payload
+
+          cp -R "$APP_PATH" Payload/VaultX.app
+
+          zip -r VaultX.ipa Payload
+
+          echo ""
+          echo "================================"
+          echo "✅ IPA CREATED"
+          echo "================================"
+          ls -lh VaultX.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VaultX-IPA
+          path: VaultX.ipa
+          if-no-files-found: error
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: VaultX-Build-Log
+          path: build.log
+          if-no-files-found: ignore

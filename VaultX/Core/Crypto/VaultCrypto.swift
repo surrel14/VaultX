@@ -65,11 +65,19 @@ struct VaultCrypto {
         return SymmetricKey(data: output)
     }
 
+    /// Dimensione fissa dell'envelope: magic 6 + versione 1 + nonce + tag.
+    static let envelopeOverhead = 6 + 1 + nonceLength + tagLength
+
     /// VaultX v2 envelope:
-    /// [magic 6][version 1][salt 16][nonce 12][ciphertext N][tag 16]
+    /// [magic 6][version 1][nonce 12][ciphertext N][tag 16]
     static func encrypt(_ plaintext: Data, using keyData: Data) throws -> Data {
         guard keyData.count == keyLength else { throw VaultCryptoError.invalidFile }
-        let key = SymmetricKey(data: keyData)
+        return try encrypt(plaintext, using: SymmetricKey(data: keyData))
+    }
+
+    /// Variante con `SymmetricKey`: la VaultSession passa una chiave temporanea
+    /// (CryptoKit la azzera quando viene rilasciata) senza esporre `Data`.
+    static func encrypt(_ plaintext: Data, using key: SymmetricKey) throws -> Data {
         let nonceData = try randomBytes(count: nonceLength)
         let nonce = try AES.GCM.Nonce(data: nonceData)
         let sealed = try AES.GCM.seal(plaintext, using: key, nonce: nonce)
@@ -84,6 +92,10 @@ struct VaultCrypto {
 
     static func decrypt(_ encrypted: Data, using keyData: Data) throws -> Data {
         guard keyData.count == keyLength else { throw VaultCryptoError.invalidFile }
+        return try decrypt(encrypted, using: SymmetricKey(data: keyData))
+    }
+
+    static func decrypt(_ encrypted: Data, using key: SymmetricKey) throws -> Data {
         let magic = Data("VLTX02".utf8)
         guard encrypted.count >= magic.count + 1 + nonceLength + tagLength else {
             throw VaultCryptoError.invalidFile
@@ -99,7 +111,6 @@ struct VaultCrypto {
 
         let ciphertext = body.prefix(body.count - tagLength)
         let tag = body.suffix(tagLength)
-        let key = SymmetricKey(data: keyData)
 
         do {
             let nonce = try AES.GCM.Nonce(data: Data(nonceData))
