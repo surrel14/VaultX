@@ -32,6 +32,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.VaultX
         PRODUCT_NAME: VaultX
         EXECUTABLE_NAME: VaultX
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         INFOPLIST_FILE: VaultX/Info.plist
         GENERATE_INFOPLIST_FILE: NO
         SKIP_INSTALL: NO
