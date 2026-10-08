@@ -14,6 +14,8 @@ struct UnlockVaultView: View {
     @State private var biometricsEnabled = false
     @State private var enableBiometrics = false
     @State private var didAutoPrompt = false
+    @State private var hasRecoveryKey = false
+    @State private var showingReset = false
     @State private var errorMessage: String?
     @State private var showingError = false
 
@@ -64,6 +66,14 @@ struct UnlockVaultView: View {
                 .submitLabel(.go)
                 .onSubmit {
                     unlockWithPassword()
+                }
+
+                if hasRecoveryKey {
+
+                    Button("Password dimenticata?") {
+                        showingReset = true
+                    }
+                    .font(.footnote)
                 }
             }
 
@@ -138,7 +148,16 @@ struct UnlockVaultView: View {
         } message: {
             Text(errorMessage ?? "")
         }
+        .sheet(isPresented: $showingReset) {
+
+            ResetPasswordView(vaultURL: vaultURL) { newPassword in
+                password = newPassword
+                unlockWithPassword()
+            }
+        }
         .onAppear {
+
+            hasRecoveryKey = VaultStore.shared.hasRecoveryKey(at: vaultURL)
 
             biometricsEnabled = VaultStore.shared
                 .isBiometricUnlockEnabled(for: vaultURL)

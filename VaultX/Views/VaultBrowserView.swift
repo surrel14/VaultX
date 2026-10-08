@@ -1,6 +1,7 @@
 import SwiftUI
 import UIKit
 import QuickLook
+import PhotosUI
 
 // MARK: - Support types
 
@@ -49,19 +50,19 @@ enum NameEditor {
 struct VaultShareItem: Identifiable {
 
     let id = UUID()
-    let url: URL
+    let urls: [URL]
 }
 
 struct ActivityView: UIViewControllerRepresentable {
 
-    let url: URL
+    let urls: [URL]
 
     func makeUIViewController(
         context: Context
     ) -> UIActivityViewController {
 
         UIActivityViewController(
-            activityItems: [url],
+            activityItems: urls,
             applicationActivities: nil
         )
     }
@@ -86,6 +87,9 @@ struct VaultBrowserView: View {
 
     let title: String
 
+    /// Cambia quando il contenuto è stato modificato da fuori (es. import da "Apri con…").
+    let reloadToken: UUID
+
     let onLock: () -> Void
 
     @AppStorage("browser.sortField")
@@ -99,16 +103,26 @@ struct VaultBrowserView: View {
     @State private var busyMessage: String?
     @State private var biometricsEnabled = false
 
+    @State private var isSelecting = false
+    @State private var selection: Set<URL> = []
+
     @State private var showingImporter = false
+    @State private var showingPhotoPicker = false
+    @State private var photoSelection: [PhotosPickerItem] = []
+    @State private var showingCamera = false
+
     @State private var previewURL: URL?
     @State private var shareItem: VaultShareItem?
-    @State private var moveCandidate: VaultItem?
+    @State private var moveRequest: MoveRequest?
+
+    @State private var showingChangePassword = false
+    @State private var showingRecovery = false
 
     @State private var nameEditor: NameEditor?
     @State private var nameDraft = ""
     @State private var showingNameEditor = false
 
-    @State private var deletionCandidate: VaultItem?
+    @State private var deletionCandidates: [VaultItem] = []
     @State private var showingDeleteConfirm = false
 
     @State private var errorMessage: String?
@@ -117,7 +131,11 @@ struct VaultBrowserView: View {
     var body: some View {
 
         content
-            .navigationTitle(title)
+            .navigationTitle(
+                isSelecting
+                    ? "\(selection.count) selezionati"
+                    : title
+            )
             .navigationBarTitleDisplayMode(.inline)
             .searchable(
                 text: $searchText,
@@ -126,7 +144,13 @@ struct VaultBrowserView: View {
             .toolbar {
                 toolbarContent
             }
+            .toolbar(isSelecting ? .visible : .hidden, for: .bottomBar)
             .quickLookPreview($previewURL)
+            .photosPicker(
+                isPresented: $showingPhotoPicker,
+                selection: $photoSelection,
+                matching: .any(of: [.images, .videos])
+            )
             .overlay {
                 busyOverlay
             }
@@ -137,6 +161,12 @@ struct VaultBrowserView: View {
                 loadItems()
                 biometricsEnabled = VaultStore.shared
                     .isBiometricUnlockEnabled(for: session.vaultURL)
+            }
+            .onChange(of: reloadToken) { _ in
+                loadItems()
+            }
+            .onChange(of: photoSelection) { picked in
+                importPhotos(picked)
             }
             .onChange(of: previewURL) { newValue in
                 if newValue == nil {
@@ -198,6 +228,36 @@ struct VaultBrowserView: View {
     @ViewBuilder
     private func row(for item: VaultItem) -> some View {
 
+        if isSelecting {
+            selectableRow(for: item)
+        } else {
+            standardRow(for: item)
+        }
+    }
+
+    private func selectableRow(for item: VaultItem) -> some View {
+
+        let selected = selection.contains(item.url)
+
+        return Button {
+            toggleSelection(item)
+        } label: {
+
+            HStack(spacing: 12) {
+
+                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                    .font(.title3)
+                    .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+
+                VaultItemRow(item: item, session: session)
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityValue(selected ? "Selezionato" : "Non selezionato")
+    }
+
+    private func standardRow(for item: VaultItem) -> some View {
+
         Group {
 
             if item.isFolder {
@@ -222,7 +282,7 @@ struct VaultBrowserView: View {
         .swipeActions(edge: .trailing, allowsFullSwipe: false) {
 
             Button(role: .destructive) {
-                requestDelete(item)
+                requestDelete([item])
             } label: {
                 Label("Elimina", systemImage: "trash")
             }
@@ -239,7 +299,7 @@ struct VaultBrowserView: View {
             if !item.isFolder {
 
                 Button {
-                    exportItem(item)
+                    exportItems([item])
                 } label: {
                     Label("Esporta", systemImage: "square.and.arrow.up")
                 }
@@ -247,7 +307,7 @@ struct VaultBrowserView: View {
             }
 
             Button {
-                moveCandidate = item
+                moveRequest = MoveRequest(items: [item])
             } label: {
                 Label("Sposta", systemImage: "folder")
             }
@@ -267,7 +327,7 @@ struct VaultBrowserView: View {
             }
 
             Button {
-                exportItem(item)
+                exportItems([item])
             } label: {
                 Label("Esporta…", systemImage: "square.and.arrow.up")
             }
@@ -280,13 +340,19 @@ struct VaultBrowserView: View {
         }
 
         Button {
-            moveCandidate = item
+            moveRequest = MoveRequest(items: [item])
         } label: {
             Label("Sposta…", systemImage: "folder")
         }
 
+        Button {
+            beginSelection(with: item)
+        } label: {
+            Label("Seleziona", systemImage: "checkmark.circle")
+        }
+
         Button(role: .destructive) {
-            requestDelete(item)
+            requestDelete([item])
         } label: {
             Label("Elimina", systemImage: "trash")
         }
@@ -357,28 +423,102 @@ struct VaultBrowserView: View {
 
         ToolbarItemGroup(placement: .navigationBarTrailing) {
 
-            Button {
-                onLock()
-            } label: {
-                Image(systemName: "lock.fill")
+            if isSelecting {
+
+                Button(allVisibleSelected ? "Nessuno" : "Tutti") {
+                    toggleSelectAll()
+                }
+
+                Button("Fine") {
+                    endSelection()
+                }
+
+            } else {
+
+                Button {
+                    onLock()
+                } label: {
+                    Image(systemName: "lock.fill")
+                }
+                .accessibilityLabel("Blocca vault")
+
+                actionsMenu
             }
-            .accessibilityLabel("Blocca vault")
+        }
+
+        ToolbarItemGroup(placement: .bottomBar) {
+
+            if isSelecting {
+
+                Button {
+                    exportItems(selectedItems.filter { !$0.isFolder })
+                } label: {
+                    Label("Esporta", systemImage: "square.and.arrow.up")
+                }
+                .disabled(!canExportSelection)
+
+                Spacer()
+
+                Button {
+                    moveRequest = MoveRequest(items: selectedItems)
+                } label: {
+                    Label("Sposta", systemImage: "folder")
+                }
+                .disabled(selection.isEmpty)
+
+                Spacer()
+
+                Button(role: .destructive) {
+                    requestDelete(selectedItems)
+                } label: {
+                    Label("Elimina", systemImage: "trash")
+                }
+                .disabled(selection.isEmpty)
+            }
+        }
+    }
+
+    private var actionsMenu: some View {
+
+        Menu {
+
+            Button {
+                showingImporter = true
+            } label: {
+                Label("Importa file", systemImage: "square.and.arrow.down")
+            }
+
+            Button {
+                showingPhotoPicker = true
+            } label: {
+                Label("Importa da Foto", systemImage: "photo.on.rectangle")
+            }
+
+            if CameraPicker.isAvailable {
+
+                Button {
+                    startCamera()
+                } label: {
+                    Label("Scatta foto", systemImage: "camera")
+                }
+            }
+
+            Button {
+                startNewFolder()
+            } label: {
+                Label("Nuova cartella", systemImage: "folder.badge.plus")
+            }
+
+            Divider()
+
+            Button {
+                beginSelection()
+            } label: {
+                Label("Seleziona", systemImage: "checkmark.circle")
+            }
+            .disabled(items.isEmpty)
 
             Menu {
-
-                Button {
-                    showingImporter = true
-                } label: {
-                    Label("Importa file", systemImage: "square.and.arrow.down")
-                }
-
-                Button {
-                    startNewFolder()
-                } label: {
-                    Label("Nuova cartella", systemImage: "folder.badge.plus")
-                }
-
-                Divider()
 
                 Picker("Ordina per", selection: $sortFieldRaw) {
 
@@ -392,9 +532,27 @@ struct VaultBrowserView: View {
                     Text("Decrescente").tag(false)
                 }
 
-                if BiometricAuth.shared.isAvailable {
+            } label: {
+                Label("Ordina", systemImage: "arrow.up.arrow.down")
+            }
 
-                    Divider()
+            Divider()
+
+            Menu {
+
+                Button {
+                    showingChangePassword = true
+                } label: {
+                    Label("Cambia password…", systemImage: "key")
+                }
+
+                Button {
+                    showingRecovery = true
+                } label: {
+                    Label("Chiave di recupero…", systemImage: "lifepreserver")
+                }
+
+                if BiometricAuth.shared.isAvailable {
 
                     Toggle(isOn: biometricBinding) {
                         Label(
@@ -405,10 +563,13 @@ struct VaultBrowserView: View {
                 }
 
             } label: {
-                Image(systemName: "ellipsis.circle")
+                Label("Sicurezza", systemImage: "lock.shield")
             }
-            .accessibilityLabel("Altre azioni")
+
+        } label: {
+            Image(systemName: "ellipsis.circle")
         }
+        .accessibilityLabel("Altre azioni")
     }
 
     // MARK: - Presentations (sheet / alert)
@@ -435,21 +596,46 @@ struct VaultBrowserView: View {
                 }
 
             Color.clear
+                .fullScreenCover(isPresented: $showingCamera) {
+
+                    CameraPicker(
+                        onCapture: { image in
+                            importCapturedPhoto(image)
+                        },
+                        onCancel: {
+                            showingCamera = false
+                        }
+                    )
+                    .ignoresSafeArea()
+                }
+
+            Color.clear
                 .sheet(item: $shareItem) { item in
 
-                    ActivityView(url: item.url)
+                    ActivityView(urls: item.urls)
                         .presentationDetents([.medium, .large])
                 }
 
             Color.clear
-                .sheet(item: $moveCandidate) { item in
+                .sheet(item: $moveRequest) { request in
 
                     FolderPickerView(
                         session: session,
-                        item: item
+                        items: request.items
                     ) {
+                        endSelection()
                         loadItems()
                     }
+                }
+
+            Color.clear
+                .sheet(isPresented: $showingChangePassword) {
+                    ChangePasswordView(vaultURL: session.vaultURL)
+                }
+
+            Color.clear
+                .sheet(isPresented: $showingRecovery) {
+                    RecoveryKeyView(session: session)
                 }
 
             Color.clear
@@ -578,6 +764,9 @@ struct VaultBrowserView: View {
 
             items = try session.items(in: directory)
 
+            // Toglie dalla selezione ciò che non esiste più.
+            selection.formIntersection(Set(items.map(\.url)))
+
         } catch VaultStoreError.locked {
 
             items = []
@@ -585,6 +774,57 @@ struct VaultBrowserView: View {
         } catch {
 
             showError(error.localizedDescription)
+        }
+    }
+
+    // MARK: - Selection
+
+    private var selectedItems: [VaultItem] {
+        items.filter { selection.contains($0.url) }
+    }
+
+    private var allVisibleSelected: Bool {
+
+        !visibleItems.isEmpty
+            && visibleItems.allSatisfy { selection.contains($0.url) }
+    }
+
+    /// Le cartelle non si esportano: l'esportazione è attiva solo se ci sono soli file.
+    private var canExportSelection: Bool {
+
+        !selection.isEmpty
+            && selectedItems.allSatisfy { !$0.isFolder }
+    }
+
+    private func beginSelection(with item: VaultItem? = nil) {
+
+        isSelecting = true
+        selection = item.map { Set([$0.url]) } ?? []
+    }
+
+    private func endSelection() {
+
+        isSelecting = false
+        selection = []
+    }
+
+    private func toggleSelection(_ item: VaultItem) {
+
+        if selection.contains(item.url) {
+            selection.remove(item.url)
+        } else {
+            selection.insert(item.url)
+        }
+    }
+
+    private func toggleSelectAll() {
+
+        let urls = visibleItems.map(\.url)
+
+        if allVisibleSelected {
+            selection.subtract(urls)
+        } else {
+            selection.formUnion(urls)
         }
     }
 
@@ -624,28 +864,100 @@ struct VaultBrowserView: View {
         }
     }
 
+    private func importPhotos(_ pickerItems: [PhotosPickerItem]) {
+
+        guard !pickerItems.isEmpty, busyMessage == nil else {
+            return
+        }
+
+        busyMessage = "Caricamento da Foto…"
+
+        let session = self.session
+        let target = directory
+
+        Task { @MainActor in
+
+            var urls: [URL] = []
+            var loadFailures = 0
+
+            for pickerItem in pickerItems {
+
+                if let picked = try? await pickerItem.loadTransferable(
+                    type: PickedFile.self
+                ) {
+                    urls.append(picked.url)
+                } else {
+                    loadFailures += 1
+                }
+            }
+
+            photoSelection = []
+
+            busyMessage = "Cifratura in corso…"
+
+            let failures = await Task.detached(
+                priority: .userInitiated
+            ) {
+                session.importFiles(urls, into: target)
+            }.value
+
+            busyMessage = nil
+
+            loadItems()
+
+            var messages = failures
+
+            if loadFailures > 0 {
+                messages.append(
+                    "\(loadFailures) elementi non sono stati caricati dalla libreria Foto."
+                )
+            }
+
+            if !messages.isEmpty {
+
+                showError(
+                    "Impossibile importare:\n"
+                    + messages.joined(separator: "\n")
+                )
+            }
+        }
+    }
+
+    private func startCamera() {
+
+        guard CameraPicker.isAvailable else {
+            showError("La fotocamera non è disponibile su questo dispositivo.")
+            return
+        }
+
+        // Senza questa chiave in Info.plist iOS chiude l'app all'apertura della fotocamera.
+        guard CameraPicker.hasUsageDescription else {
+            showError("Manca la chiave NSCameraUsageDescription in Info.plist: aggiungila per usare la fotocamera.")
+            return
+        }
+
+        showingCamera = true
+    }
+
+    private func importCapturedPhoto(_ image: UIImage) {
+
+        showingCamera = false
+
+        do {
+
+            let url = try ImportNaming.writeTemporaryPhoto(image)
+
+            importFiles([url])
+
+        } catch {
+
+            showError(error.localizedDescription)
+        }
+    }
+
     // MARK: - Open / Export
 
     private func openItem(_ item: VaultItem) {
-
-        decryptForUse(item.url) { url in
-            previewURL = url
-        }
-    }
-
-    private func exportItem(_ item: VaultItem) {
-
-        decryptForUse(item.url) { url in
-            shareItem = VaultShareItem(url: url)
-        }
-    }
-
-    /// Decifra il file in una cartella temporanea (con il nome originale)
-    /// fuori dal main thread, poi chiama `completion` con l'URL in chiaro.
-    private func decryptForUse(
-        _ file: URL,
-        completion: @escaping @MainActor (URL) -> Void
-    ) {
 
         guard busyMessage == nil else {
             return
@@ -654,6 +966,7 @@ struct VaultBrowserView: View {
         busyMessage = "Decifratura in corso…"
 
         let session = self.session
+        let file = item.url
 
         Task { @MainActor in
 
@@ -667,7 +980,7 @@ struct VaultBrowserView: View {
 
                 busyMessage = nil
 
-                completion(url)
+                previewURL = url
 
             } catch {
 
@@ -675,6 +988,45 @@ struct VaultBrowserView: View {
 
                 showError(
                     "Impossibile aprire il file: "
+                    + error.localizedDescription
+                )
+            }
+        }
+    }
+
+    /// Decifra i file in cartelle temporanee (con il nome originale) fuori dal
+    /// main thread e apre lo share sheet.
+    private func exportItems(_ files: [VaultItem]) {
+
+        guard !files.isEmpty, busyMessage == nil else {
+            return
+        }
+
+        busyMessage = "Decifratura in corso…"
+
+        let session = self.session
+        let sources = files.map(\.url)
+
+        Task { @MainActor in
+
+            do {
+
+                let plain = try await Task.detached(
+                    priority: .userInitiated
+                ) {
+                    try sources.map { try session.decryptToTemporaryFile($0) }
+                }.value
+
+                busyMessage = nil
+
+                shareItem = VaultShareItem(urls: plain)
+
+            } catch {
+
+                busyMessage = nil
+
+                showError(
+                    "Impossibile esportare: "
                     + error.localizedDescription
                 )
             }
@@ -703,9 +1055,11 @@ struct VaultBrowserView: View {
     private var isExternalUIActive: Bool {
 
         showingImporter
+            || showingPhotoPicker
+            || showingCamera
             || previewURL != nil
             || shareItem != nil
-            || moveCandidate != nil
+            || moveRequest != nil
             || busyMessage != nil
     }
 
@@ -760,35 +1114,42 @@ struct VaultBrowserView: View {
 
     private var deleteTitle: String {
 
-        guard let item = deletionCandidate else {
-            return "Eliminare?"
+        if deletionCandidates.count == 1, let item = deletionCandidates.first {
+            return "Eliminare «\(item.name)»?"
         }
 
-        return "Eliminare «\(item.name)»?"
+        return "Eliminare \(deletionCandidates.count) elementi?"
     }
 
     private var deleteMessage: String {
 
-        guard let item = deletionCandidate else {
-            return ""
+        if deletionCandidates.count == 1, let item = deletionCandidates.first {
+
+            if item.isFolder {
+                return "La cartella e tutto il suo contenuto verranno eliminati definitivamente. L'operazione non può essere annullata."
+            }
+
+            return "Il file verrà eliminato definitivamente. L'operazione non può essere annullata."
         }
 
-        if item.isFolder {
-            return "La cartella e tutto il suo contenuto verranno eliminati definitivamente. L'operazione non può essere annullata."
-        }
-
-        return "Il file verrà eliminato definitivamente. L'operazione non può essere annullata."
+        return "Gli elementi selezionati (e il contenuto delle cartelle) verranno eliminati definitivamente. L'operazione non può essere annullata."
     }
 
-    private func requestDelete(_ item: VaultItem) {
+    private func requestDelete(_ candidates: [VaultItem]) {
 
-        deletionCandidate = item
+        guard !candidates.isEmpty else {
+            return
+        }
+
+        deletionCandidates = candidates
         showingDeleteConfirm = true
     }
 
     private func performDelete() {
 
-        guard let item = deletionCandidate, busyMessage == nil else {
+        let candidates = deletionCandidates
+
+        guard !candidates.isEmpty, busyMessage == nil else {
             return
         }
 
@@ -798,22 +1159,25 @@ struct VaultBrowserView: View {
 
         Task { @MainActor in
 
-            do {
-
-                try await Task.detached(
-                    priority: .userInitiated
-                ) {
-                    try session.deleteItem(item)
-                }.value
-
-            } catch {
-
-                showError(error.localizedDescription)
-            }
+            let failures = await Task.detached(
+                priority: .userInitiated
+            ) {
+                session.deleteItems(candidates)
+            }.value
 
             busyMessage = nil
 
+            endSelection()
+
             loadItems()
+
+            if !failures.isEmpty {
+
+                showError(
+                    "Impossibile eliminare:\n"
+                    + failures.joined(separator: "\n")
+                )
+            }
         }
     }
 
@@ -889,6 +1253,7 @@ struct VaultItemRow: View {
         }
         .padding(.vertical, 2)
         .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
         .task(id: item.url) {
             await loadThumbnail()
         }

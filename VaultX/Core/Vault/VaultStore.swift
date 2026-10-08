@@ -225,6 +225,146 @@ final class VaultStore {
         KeychainStore.delete(account: keychainAccount(for: vaultURL))
     }
 
+    // MARK: - Change password
+
+    private func wrappedKeyURL(for vault: URL) -> URL {
+        vault.appendingPathComponent("masterkey.vaultx")
+    }
+
+    /// Cambia la password: la master key resta la stessa (quindi i file non
+    /// vengono toccati e Face ID continua a funzionare), cambia solo l'involucro.
+    /// Un vault con il vecchio formato viene aggiornato al KDF più forte.
+    func changePassword(
+        at url: URL,
+        oldPassword: String,
+        newPassword: String
+    ) throws {
+
+        guard newPassword.count >= 8 else {
+            throw VaultStoreError.weakPassword
+        }
+
+        let wrappedURL = wrappedKeyURL(for: url)
+
+        var masterKey = try VaultCrypto.unwrapMasterKey(
+            try Data(contentsOf: wrappedURL),
+            password: oldPassword
+        )
+
+        defer {
+            VaultSession.wipe(&masterKey)
+        }
+
+        try VaultCrypto.wrapMasterKey(
+            masterKey,
+            password: newPassword
+        )
+        .write(
+            to: wrappedURL,
+            options: [.atomic, .completeFileProtection]
+        )
+    }
+
+    // MARK: - Recovery key
+
+    private func recoveryKeyURL(for vault: URL) -> URL {
+        vault.appendingPathComponent("recovery.vaultx")
+    }
+
+    func hasRecoveryKey(at url: URL) -> Bool {
+        fileManager.fileExists(atPath: recoveryKeyURL(for: url).path)
+    }
+
+    /// Genera (o rigenera, invalidando la precedente) la chiave di recupero.
+    /// Restituisce il testo da mostrare UNA volta all'utente: non viene salvato da nessuna parte.
+    func createRecoveryKey(for session: VaultSession) throws -> String {
+
+        var masterKey = try session.masterKeyData()
+        var secret = try RecoveryKey.generate()
+
+        defer {
+            VaultSession.wipe(&masterKey)
+            VaultSession.wipe(&secret)
+        }
+
+        try VaultCrypto.wrapMasterKey(
+            masterKey,
+            recoverySecret: secret
+        )
+        .write(
+            to: recoveryKeyURL(for: session.vaultURL),
+            options: [.atomic, .completeFileProtection]
+        )
+
+        return RecoveryKey.format(secret)
+    }
+
+    func removeRecoveryKey(at url: URL) throws {
+
+        let target = recoveryKeyURL(for: url)
+
+        if fileManager.fileExists(atPath: target.path) {
+            try SecureDelete.remove(at: target)
+        }
+    }
+
+    /// Password dimenticata: con la chiave di recupero si imposta una nuova password.
+    func resetPassword(
+        at url: URL,
+        recoveryKey: String,
+        newPassword: String
+    ) throws {
+
+        guard newPassword.count >= 8 else {
+            throw VaultStoreError.weakPassword
+        }
+
+        guard var secret = RecoveryKey.parse(recoveryKey) else {
+            throw VaultStoreError.invalidRecoveryKey
+        }
+
+        defer {
+            VaultSession.wipe(&secret)
+        }
+
+        guard hasRecoveryKey(at: url) else {
+            throw VaultStoreError.noRecoveryKey
+        }
+
+        var masterKey: Data
+
+        do {
+
+            masterKey = try VaultCrypto.unwrapMasterKey(
+                try Data(contentsOf: recoveryKeyURL(for: url)),
+                recoverySecret: secret
+            )
+
+        } catch VaultCryptoError.authenticationFailed {
+
+            throw VaultStoreError.invalidRecoveryKey
+        }
+
+        defer {
+            VaultSession.wipe(&masterKey)
+        }
+
+        // La chiave deve davvero aprire questo vault.
+        _ = try VaultCrypto.decrypt(
+            try Data(contentsOf: url.appendingPathComponent("vault.manifest")),
+            using: masterKey
+        )
+
+        try VaultCrypto.wrapMasterKey(
+            masterKey,
+            password: newPassword
+        )
+        .write(
+            to: wrappedKeyURL(for: url),
+            options: [.atomic, .completeFileProtection]
+        )
+    }
+
     // MARK: - List / Delete
 
     func vaults() throws -> [URL] {
@@ -288,6 +428,8 @@ enum VaultStoreError: LocalizedError {
     case invalidLocation
     case invalidMove
     case biometricUnavailable
+    case invalidRecoveryKey
+    case noRecoveryKey
 
     var errorDescription: String? {
 
@@ -316,6 +458,12 @@ enum VaultStoreError: LocalizedError {
 
         case .biometricUnavailable:
             return "Lo sblocco biometrico non è più disponibile per questo vault (i dati biometrici sono cambiati). Usa la password."
+
+        case .invalidRecoveryKey:
+            return "Chiave di recupero non valida."
+
+        case .noRecoveryKey:
+            return "Questo vault non ha una chiave di recupero."
         }
     }
 }

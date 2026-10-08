@@ -14,6 +14,7 @@ struct CreateVaultView: View {
     @State private var password = ""
 
     @State private var confirmPassword = ""
+    @State private var isCreating = false
 
     @State private var errorMessage: String?
 
@@ -41,11 +42,15 @@ struct CreateVaultView: View {
                         "Password",
                         text: $password
                     )
+                    .textContentType(.newPassword)
 
                     SecureField(
                         "Conferma password",
                         text: $confirmPassword
                     )
+                    .textContentType(.newPassword)
+
+                    PasswordStrengthView(password: password)
 
                 } header: {
 
@@ -71,12 +76,16 @@ struct CreateVaultView: View {
 
                             Spacer()
 
-                            Text(
-                                "Crea vault"
-                            )
-                            .fontWeight(
-                                .semibold
-                            )
+                            if isCreating {
+                                ProgressView()
+                            } else {
+                                Text(
+                                    "Crea vault"
+                                )
+                                .fontWeight(
+                                    .semibold
+                                )
+                            }
 
                             Spacer()
                         }
@@ -141,6 +150,8 @@ struct CreateVaultView: View {
         password.count >= 8
         &&
         password == confirmPassword
+        &&
+        !isCreating
     }
 
 
@@ -180,25 +191,38 @@ struct CreateVaultView: View {
         }
 
 
-        do {
+        isCreating = true
 
-            _ =
-                try VaultStore.shared.createVault(
-                    named:
-                        name,
-                    password:
-                        password
+        let enteredPassword = password
+
+        // PBKDF2 (600k iterazioni) è pesante: fuori dal main thread.
+        Task { @MainActor in
+
+            do {
+
+                _ = try await Task.detached(
+                    priority: .userInitiated
+                ) {
+                    try VaultStore.shared.createVault(
+                        named: name,
+                        password: enteredPassword
+                    )
+                }.value
+
+                isCreating = false
+
+                onCreated()
+
+                dismiss()
+
+            } catch {
+
+                isCreating = false
+
+                showError(
+                    error.localizedDescription
                 )
-
-            onCreated()
-
-            dismiss()
-
-        } catch {
-
-            showError(
-                error.localizedDescription
-            )
+            }
         }
     }
 

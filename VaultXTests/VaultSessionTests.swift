@@ -201,6 +201,48 @@ final class VaultSessionTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: folder.path))
     }
 
+    // MARK: - Bulk operations
+
+    func testBulkMoveSkipsItemsAlreadyInDestination() throws {
+
+        let folder = try session.createFolder(named: "Dest", in: session.rootDirectory)
+
+        for name in ["a.txt", "b.txt"] {
+
+            let source = try makeSourceFile(named: name)
+            try session.importFile(at: source, into: session.rootDirectory)
+        }
+
+        let files = try session.items(in: session.rootDirectory).filter { !$0.isFolder }
+
+        XCTAssertEqual(files.count, 2)
+        XCTAssertEqual(session.movableCount(files, to: folder), 2)
+
+        let failures = session.moveItems(files, to: folder)
+
+        XCTAssertTrue(failures.isEmpty)
+
+        let moved = try session.items(in: folder).map(\.name).sorted()
+        XCTAssertEqual(moved, ["a.txt", "b.txt"])
+    }
+
+    func testBulkDeleteIgnoresItemsInsideSelectedFolder() throws {
+
+        let folder = try session.createFolder(named: "Cartella", in: session.rootDirectory)
+
+        let source = try makeSourceFile(named: "dentro.txt")
+        try session.importFile(at: source, into: folder)
+
+        let child = try XCTUnwrap(session.items(in: folder).first)
+        let parent = try XCTUnwrap(session.items(in: session.rootDirectory).first)
+
+        // Cartella + file contenuto: non deve dare errori "file non trovato".
+        let failures = session.deleteItems([child, parent])
+
+        XCTAssertTrue(failures.isEmpty)
+        XCTAssertTrue(try session.items(in: session.rootDirectory).isEmpty)
+    }
+
     // MARK: - Lock / key management
 
     func testLockWipesKeyAndBlocksOperations() throws {

@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 // MARK: - Navigation helpers
 
@@ -41,6 +42,16 @@ struct ContentView: View {
 
     @State private var backgroundedAt: Date?
 
+    /// Incrementato quando il contenuto del vault cambia da fuori (import da "Apri con…").
+    @State private var reloadToken = UUID()
+
+    /// File ricevuti da altre app ("Apri con VaultX") in attesa di essere importati.
+    @State private var pendingIncoming: [URL] = []
+    @State private var showingIncomingConfirm = false
+    @State private var isImportingIncoming = false
+
+    @State private var isScreenCaptured = false
+
     @State private var errorMessage: String?
     @State private var showingError = false
 
@@ -57,6 +68,7 @@ struct ContentView: View {
                             session: session,
                             directory: folder.url,
                             title: folder.url.lastPathComponent,
+                            reloadToken: reloadToken,
                             onLock: { lockVault() }
                         )
                     }
@@ -65,11 +77,25 @@ struct ContentView: View {
         .overlay {
             privacyCover
         }
+        .overlay {
+            incomingImportOverlay
+        }
         .background {
             presentations
         }
         .onAppear {
             loadVaults()
+            isScreenCaptured = Self.currentScreenIsCaptured()
+        }
+        .onOpenURL { url in
+            handleIncoming(url)
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIScreen.capturedDidChangeNotification
+            )
+        ) { _ in
+            isScreenCaptured = Self.currentScreenIsCaptured()
         }
         .onChange(of: scenePhase) { phase in
             handleScenePhase(phase)
@@ -77,8 +103,22 @@ struct ContentView: View {
         .onChange(of: activeSession?.vaultURL) { url in
 
             if url != nil {
+
                 startInactivityMonitor()
+
+                // Aspetta che lo sheet di sblocco sia sparito prima di mostrare l'alert.
+                if !pendingIncoming.isEmpty {
+
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
+
+                        if activeSession != nil, !pendingIncoming.isEmpty {
+                            showingIncomingConfirm = true
+                        }
+                    }
+                }
+
             } else {
+
                 InactivityMonitor.shared.stop()
             }
         }
@@ -95,6 +135,7 @@ struct ContentView: View {
                 session: session,
                 directory: session.rootDirectory,
                 title: session.manifest.name,
+                reloadToken: reloadToken,
                 onLock: { lockVault() }
             )
 
@@ -115,6 +156,9 @@ struct ContentView: View {
             }
         }
         .navigationTitle("VaultX")
+        .safeAreaInset(edge: .top) {
+            pendingBanner
+        }
         .toolbar {
 
             ToolbarItem(placement: .navigationBarLeading) {
@@ -245,6 +289,25 @@ struct ContentView: View {
 
             Color.clear
                 .alert(
+                    incomingTitle,
+                    isPresented: $showingIncomingConfirm
+                ) {
+
+                    Button("Importa") {
+                        importIncoming()
+                    }
+
+                    Button("Annulla", role: .cancel) {
+                        discardIncoming()
+                    }
+
+                } message: {
+
+                    Text("I file verranno cifrati nella cartella «\(incomingDestinationName)».")
+                }
+
+            Color.clear
+                .alert(
                     "Errore",
                     isPresented: $showingError
                 ) {
@@ -261,7 +324,7 @@ struct ContentView: View {
     @ViewBuilder
     private var privacyCover: some View {
 
-        if activeSession != nil, scenePhase != .active {
+        if activeSession != nil, scenePhase != .active || isScreenCaptured {
 
             ZStack {
 
@@ -273,8 +336,12 @@ struct ContentView: View {
                     Image(systemName: "lock.fill")
                         .font(.system(size: 44))
 
-                    Text("Vault protetto")
-                        .font(.headline)
+                    Text(
+                        isScreenCaptured && scenePhase == .active
+                            ? "Registrazione schermo attiva"
+                            : "Vault protetto"
+                    )
+                    .font(.headline)
                 }
                 .foregroundStyle(.secondary)
             }
@@ -328,6 +395,153 @@ struct ContentView: View {
 
             loadVaults()
         }
+    }
+
+    // MARK: - Incoming files ("Apri con VaultX")
+
+    private var incomingTitle: String {
+
+        pendingIncoming.count == 1
+            ? "Importare «\(pendingIncoming[0].lastPathComponent)»?"
+            : "Importare \(pendingIncoming.count) file?"
+    }
+
+    /// Cartella attualmente aperta nel vault (o la radice).
+    private var incomingDestination: URL? {
+        path.last?.url ?? activeSession?.rootDirectory
+    }
+
+    private var incomingDestinationName: String {
+
+        if let last = path.last {
+            return last.url.lastPathComponent
+        }
+
+        return activeSession?.manifest.name ?? ""
+    }
+
+    @ViewBuilder
+    private var pendingBanner: some View {
+
+        if !pendingIncoming.isEmpty {
+
+            HStack(spacing: 12) {
+
+                Image(systemName: "tray.and.arrow.down.fill")
+                    .foregroundStyle(Color.accentColor)
+
+                Text(
+                    pendingIncoming.count == 1
+                        ? "1 file in attesa: sblocca un vault per importarlo."
+                        : "\(pendingIncoming.count) file in attesa: sblocca un vault per importarli."
+                )
+                .font(.footnote)
+
+                Spacer(minLength: 0)
+
+                Button("Scarta") {
+                    discardIncoming()
+                }
+                .font(.footnote.weight(.semibold))
+            }
+            .padding(12)
+            .background(.regularMaterial)
+        }
+    }
+
+    @ViewBuilder
+    private var incomingImportOverlay: some View {
+
+        if isImportingIncoming {
+
+            ZStack {
+
+                Color.black
+                    .opacity(0.25)
+                    .ignoresSafeArea()
+
+                ProgressView("Cifratura in corso…")
+                    .padding(20)
+                    .background(
+                        .regularMaterial,
+                        in: RoundedRectangle(cornerRadius: 14)
+                    )
+            }
+        }
+    }
+
+    private func handleIncoming(_ url: URL) {
+
+        guard url.isFileURL else {
+            return
+        }
+
+        pendingIncoming.append(url)
+
+        if activeSession != nil {
+            showingIncomingConfirm = true
+        }
+    }
+
+    private func importIncoming() {
+
+        guard let session = activeSession,
+              let destination = incomingDestination,
+              !pendingIncoming.isEmpty
+        else {
+            return
+        }
+
+        let urls = pendingIncoming
+
+        pendingIncoming = []
+
+        isImportingIncoming = true
+
+        Task { @MainActor in
+
+            let failures = await Task.detached(
+                priority: .userInitiated
+            ) {
+                session.importFiles(urls, into: destination)
+            }.value
+
+            isImportingIncoming = false
+
+            reloadToken = UUID()
+
+            if !failures.isEmpty {
+
+                errorMessage = "Impossibile importare:\n"
+                    + failures.joined(separator: "\n")
+
+                showingError = true
+            }
+        }
+    }
+
+    /// Scarta i file in attesa eliminando le copie ricevute.
+    private func discardIncoming() {
+
+        let urls = pendingIncoming
+
+        pendingIncoming = []
+
+        Task.detached(priority: .utility) {
+
+            for url in urls where VaultSession.isDisposableCopy(url) {
+                try? SecureDelete.remove(at: url)
+            }
+        }
+    }
+
+    private static func currentScreenIsCaptured() -> Bool {
+
+        let scene = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first
+
+        return scene?.screen.isCaptured ?? false
     }
 
     // MARK: - Lock

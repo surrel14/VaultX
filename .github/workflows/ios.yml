@@ -40,6 +40,22 @@ jobs:
         run: |
           xcodegen generate
 
+      - name: Run unit tests
+        continue-on-error: true
+        run: |
+          set -o pipefail
+
+          UDID=$(xcrun simctl list devices available iPhone | grep -Eo '[0-9A-F]{8}-([0-9A-F]{4}-){3}[0-9A-F]{12}' | head -n 1)
+          echo "Simulator: $UDID"
+
+          xcodebuild \
+            -project VaultX.xcodeproj \
+            -scheme VaultXTests \
+            -destination "id=$UDID" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            test | tee test.log
+
       - name: Build VaultX
         run: |
           set -o pipefail
@@ -106,6 +122,14 @@ jobs:
           name: VaultX-IPA
           path: VaultX.ipa
           if-no-files-found: error
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: VaultX-Test-Log
+          path: test.log
+          if-no-files-found: ignore
 
       - name: Upload build log
         if: always()

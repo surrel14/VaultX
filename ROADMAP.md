@@ -21,6 +21,10 @@
 - [x] Auto-lock (background / inactivity) and privacy cover
 - [x] Face ID / Touch ID unlock through the Keychain
 - [x] Master key wiped from memory on lock
+- [x] Change password, recovery key, 600k-iteration PBKDF2 for new wraps
+- [x] Multi-select, import from Photos / camera / "Open in"
+- [ ] Format v3: encrypted names, chunked streaming, per-file keys + AAD, migration from v2
+- [ ] Vaults stored in iCloud Drive / other Files locations (after format v3)
 
 ## v0.3 — File Provider
 

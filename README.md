@@ -15,10 +15,13 @@ VaultX is an iOS/iPadOS encrypted-file vault project designed around Apple's Fil
 - Sorting (name / date / size / kind) and per-folder search
 - Auto-lock: when the app goes to the background (immediately or after a delay) and after inactivity
 - Face ID / Touch ID unlock via the Keychain (opt-in per vault, `biometryCurrentSet`)
+- Change password and optional recovery key (256-bit, base32); new wraps use PBKDF2-HMAC-SHA256 with 600k iterations, NFC-normalised passwords, authenticated headers (legacy v0.2 vaults are still readable and get upgraded on password change)
+- Multi-select (move / export / delete), import from Photos, camera and "Open in VaultX" from other apps
+- Password strength meter, screen-recording cover
 - Master key kept in a zeroable buffer and wiped on lock; plaintext temp copies are overwritten and deleted
 - Privacy cover in the app switcher while a vault is open
-- Unit tests for key wrapping, encryption, tamper detection and vault operations
-- GitHub Actions build pipeline
+- Unit tests for key wrapping, recovery key, encryption, tamper detection and vault operations
+- GitHub Actions build pipeline (unit tests run on the simulator, non-blocking)
 
 ## Security model
 

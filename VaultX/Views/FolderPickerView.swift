@@ -1,11 +1,18 @@
 import SwiftUI
 
-/// Sheet per scegliere la cartella di destinazione di uno spostamento.
+/// Richiesta di spostamento (Identifiable per `.sheet(item:)`).
+struct MoveRequest: Identifiable {
+
+    let id = UUID()
+    let items: [VaultItem]
+}
+
+/// Sheet per scegliere la cartella di destinazione di uno o più elementi.
 struct FolderPickerView: View {
 
     let session: VaultSession
 
-    let item: VaultItem
+    let items: [VaultItem]
 
     let onMoved: () -> Void
 
@@ -21,7 +28,7 @@ struct FolderPickerView: View {
 
             FolderPickerLevel(
                 session: session,
-                item: item,
+                items: items,
                 directory: session.rootDirectory,
                 title: session.manifest.name,
                 onChoose: { folder in
@@ -44,17 +51,17 @@ struct FolderPickerView: View {
 
     private func move(to folder: URL) {
 
-        do {
+        let failures = session.moveItems(items, to: folder)
 
-            try session.moveItem(item, to: folder)
+        onMoved()
 
-            onMoved()
+        if failures.isEmpty {
 
             dismiss()
 
-        } catch {
+        } else {
 
-            errorMessage = error.localizedDescription
+            errorMessage = failures.joined(separator: "\n")
             showingError = true
         }
     }
@@ -63,7 +70,7 @@ struct FolderPickerView: View {
 private struct FolderPickerLevel: View {
 
     let session: VaultSession
-    let item: VaultItem
+    let items: [VaultItem]
     let directory: URL
     let title: String
     let onChoose: (URL) -> Void
@@ -87,7 +94,7 @@ private struct FolderPickerLevel: View {
 
                     FolderPickerLevel(
                         session: session,
-                        item: item,
+                        items: items,
                         directory: folder.url,
                         title: folder.name,
                         onChoose: onChoose,
@@ -117,7 +124,7 @@ private struct FolderPickerLevel: View {
                 Button("Sposta qui") {
                     onChoose(directory)
                 }
-                .disabled(!session.canMove(item, to: directory))
+                .disabled(session.movableCount(items, to: directory) == 0)
             }
         }
         .onAppear {
@@ -129,13 +136,17 @@ private struct FolderPickerLevel: View {
 
         let all = (try? session.items(in: directory)) ?? []
 
-        let movingPath = item.url.standardizedFileURL.path
+        // Una cartella che stiamo spostando non può essere una destinazione.
+        let movingFolders = Set(
+            items
+                .filter { $0.isFolder }
+                .map { $0.url.standardizedFileURL.path }
+        )
 
         folders = all
             .filter { entry in
                 entry.isFolder
-                    && !(item.isFolder
-                         && entry.url.standardizedFileURL.path == movingPath)
+                    && !movingFolders.contains(entry.url.standardizedFileURL.path)
             }
             .sorted {
                 $0.name.localizedStandardCompare($1.name) == .orderedAscending

@@ -482,7 +482,71 @@ final class VaultSession: @unchecked Sendable {
         return destination
     }
 
+    /// Quanti degli elementi possono essere spostati nella cartella indicata.
+    func movableCount(
+        _ items: [VaultItem],
+        to folder: URL
+    ) -> Int {
+
+        items.filter { canMove($0, to: folder) }.count
+    }
+
+    /// Sposta più elementi. Quelli che non si possono spostare (già nella cartella,
+    /// o una cartella dentro se stessa) vengono saltati. Restituisce un messaggio
+    /// per ogni errore.
+    func moveItems(
+        _ items: [VaultItem],
+        to folder: URL
+    ) -> [String] {
+
+        var failures: [String] = []
+
+        for item in topLevel(items) where canMove(item, to: folder) {
+
+            do {
+                try moveItem(item, to: folder)
+            } catch {
+                failures.append("\(item.name): \(error.localizedDescription)")
+            }
+        }
+
+        return failures
+    }
+
+    /// Toglie dalla lista gli elementi contenuti in una cartella anch'essa selezionata
+    /// (verrebbero spostati/eliminati insieme alla cartella).
+    private func topLevel(_ items: [VaultItem]) -> [VaultItem] {
+
+        let folderPaths = items
+            .filter { $0.isFolder }
+            .map { $0.url.resolvingSymlinksInPath().path }
+
+        return items.filter { item in
+
+            let path = item.url.resolvingSymlinksInPath().path
+
+            return !folderPaths.contains { path.hasPrefix($0 + "/") }
+        }
+    }
+
     // MARK: - Delete
+
+    /// Elimina più elementi. Restituisce un messaggio per ogni errore.
+    func deleteItems(_ items: [VaultItem]) -> [String] {
+
+        var failures: [String] = []
+
+        for item in topLevel(items) {
+
+            do {
+                try deleteItem(item)
+            } catch {
+                failures.append("\(item.name): \(error.localizedDescription)")
+            }
+        }
+
+        return failures
+    }
 
     /// Elimina un file o una cartella (con tutto il contenuto): sovrascrive i
     /// file con dati casuali (best effort) e poi li rimuove.
@@ -573,16 +637,30 @@ final class VaultSession: @unchecked Sendable {
         return failures
     }
 
-    /// Il picker con `asCopy: true` lascia una copia in chiaro in tmp:
-    /// la eliminiamo dopo la cifratura (solo se sta davvero in tmp).
-    private func removeTemporaryCopy(_ url: URL) {
+    /// Copie in chiaro create per noi dal sistema (picker con `asCopy: true`,
+    /// foto importate, "Apri con…"): stanno in tmp o nella cartella Inbox
+    /// dell'app. I file originali dell'utente non vengono mai toccati.
+    static func isDisposableCopy(_ url: URL) -> Bool {
+
+        let path = url.resolvingSymlinksInPath().path
 
         let tmp = FileManager.default.temporaryDirectory
             .resolvingSymlinksInPath().path
 
-        let path = url.resolvingSymlinksInPath().path
-
         if path.hasPrefix(tmp + "/") {
+            return true
+        }
+
+        let home = URL(fileURLWithPath: NSHomeDirectory())
+            .resolvingSymlinksInPath().path
+
+        return path.hasPrefix(home + "/")
+            && url.deletingLastPathComponent().lastPathComponent.hasSuffix("Inbox")
+    }
+
+    private func removeTemporaryCopy(_ url: URL) {
+
+        if Self.isDisposableCopy(url) {
             try? SecureDelete.remove(at: url)
         }
     }

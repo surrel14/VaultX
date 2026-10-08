@@ -40,7 +40,16 @@ struct VaultCrypto {
         try randomBytes(count: keyLength)
     }
 
+    /// Derivazione con le iterazioni "legacy" (vault creati con la v0.2).
     static func deriveKey(password: String, salt: Data) throws -> SymmetricKey {
+        try deriveKey(password: password, salt: salt, iterations: iterations)
+    }
+
+    static func deriveKey(
+        password: String,
+        salt: Data,
+        iterations: UInt32
+    ) throws -> SymmetricKey {
         guard !password.isEmpty else { throw VaultCryptoError.invalidPassword }
         var output = Data(count: keyLength)
         let passwordData = Data(password.utf8)
@@ -121,50 +130,277 @@ struct VaultCrypto {
         }
     }
 
-    /// Wraps a random vault master key with a password-derived key.
+    // MARK: - Password wrapping
+
+    /// Iterazioni PBKDF2-HMAC-SHA256 per i nuovi wrap (raccomandazione OWASP 2023).
+    static let wrapIterations: UInt32 = 600_000
+
+    private static let wrapMagicV3 = Data("VLWK03".utf8)
+    private static let wrapMagicV1 = Data("VLWK01".utf8)
+
+    /// Normalizza la password (NFC): la stessa password digitata con tastiere
+    /// diverse produce così gli stessi byte.
+    static func normalized(_ password: String) -> String {
+        password.precomposedStringWithCanonicalMapping
+    }
+
+    /// Wrap v3:
+    /// [magic "VLWK03" 6][iterazioni UInt32 BE 4][salt 16][nonce 12][ciphertext 32][tag 16]
+    /// Magic, iterazioni e salt sono autenticati (AAD).
     static func wrapMasterKey(_ masterKey: Data, password: String) throws -> Data {
+
         guard masterKey.count == keyLength else { throw VaultCryptoError.invalidFile }
+
         let salt = try randomBytes(count: saltLength)
-        let passwordKey = try deriveKey(password: password, salt: salt)
+
+        var header = wrapMagicV3
+        header.append(contentsOf: withUnsafeBytes(of: wrapIterations.bigEndian) { Array($0) })
+        header.append(salt)
+
+        let passwordKey = try deriveKey(
+            password: normalized(password),
+            salt: salt,
+            iterations: wrapIterations
+        )
+
         let nonceData = try randomBytes(count: nonceLength)
         let nonce = try AES.GCM.Nonce(data: nonceData)
-        let sealed = try AES.GCM.seal(masterKey, using: passwordKey, nonce: nonce)
 
-        var result = Data("VLWK01".utf8)
-        result.append(salt)
+        let sealed = try AES.GCM.seal(
+            masterKey,
+            using: passwordKey,
+            nonce: nonce,
+            authenticating: header
+        )
+
+        var result = header
         result.append(nonceData)
         result.append(sealed.ciphertext)
         result.append(sealed.tag)
         return result
     }
 
+    /// Legge sia il formato v3 sia quello legacy "VLWK01" (210k iterazioni).
     static func unwrapMasterKey(_ wrapped: Data, password: String) throws -> Data {
-        let magic = Data("VLWK01".utf8)
-        let minimum = magic.count + saltLength + nonceLength + keyLength + tagLength
-        guard wrapped.count >= minimum, wrapped.prefix(magic.count) == magic else {
+
+        if wrapped.starts(with: wrapMagicV3) {
+            return try unwrapV3(wrapped, password: password)
+        }
+
+        if wrapped.starts(with: wrapMagicV1) {
+            return try unwrapLegacy(wrapped, password: password)
+        }
+
+        throw VaultCryptoError.invalidFile
+    }
+
+    private static func unwrapV3(_ wrapped: Data, password: String) throws -> Data {
+
+        let magicLength = wrapMagicV3.count
+        let headerLength = magicLength + 4 + saltLength
+
+        guard wrapped.count >= headerLength + nonceLength + keyLength + tagLength else {
             throw VaultCryptoError.invalidFile
         }
 
-        let saltStart = magic.count
-        let nonceStart = saltStart + saltLength
-        let bodyStart = nonceStart + nonceLength
-        let salt = wrapped[saltStart..<nonceStart]
-        let nonceData = wrapped[nonceStart..<bodyStart]
-        let body = wrapped[bodyStart...]
-        let ciphertext = body.prefix(body.count - tagLength)
-        let tag = body.suffix(tagLength)
+        let bytes = Array(wrapped)
+
+        let iterationCount = bytes[magicLength ..< magicLength + 4]
+            .reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+
+        // Valori assurdi = file corrotto/manomesso (e niente blocchi infiniti).
+        guard iterationCount >= 100_000, iterationCount <= 10_000_000 else {
+            throw VaultCryptoError.invalidFile
+        }
+
+        let header = Data(bytes[0 ..< headerLength])
+        let salt = Data(bytes[(headerLength - saltLength) ..< headerLength])
+        let nonceData = Data(bytes[headerLength ..< headerLength + nonceLength])
+        let body = Data(bytes[(headerLength + nonceLength)...])
+
+        let ciphertext = Data(body.prefix(body.count - tagLength))
+        let tag = Data(body.suffix(tagLength))
 
         do {
-            let passwordKey = try deriveKey(password: password, salt: Data(salt))
-            let nonce = try AES.GCM.Nonce(data: Data(nonceData))
-            let box = try AES.GCM.SealedBox(nonce: nonce, ciphertext: Data(ciphertext), tag: Data(tag))
-            let masterKey = try AES.GCM.open(box, using: passwordKey)
-            guard masterKey.count == keyLength else { throw VaultCryptoError.invalidFile }
+
+            let passwordKey = try deriveKey(
+                password: normalized(password),
+                salt: salt,
+                iterations: iterationCount
+            )
+
+            let nonce = try AES.GCM.Nonce(data: nonceData)
+
+            let box = try AES.GCM.SealedBox(
+                nonce: nonce,
+                ciphertext: ciphertext,
+                tag: tag
+            )
+
+            let masterKey = try AES.GCM.open(
+                box,
+                using: passwordKey,
+                authenticating: header
+            )
+
+            guard masterKey.count == keyLength else {
+                throw VaultCryptoError.invalidFile
+            }
+
             return masterKey
+
         } catch VaultCryptoError.invalidFile {
             throw VaultCryptoError.invalidFile
         } catch {
             throw VaultCryptoError.authenticationFailed
         }
+    }
+
+    /// Formato v0.2: [magic "VLWK01" 6][salt 16][nonce 12][ciphertext 32][tag 16], 210k iterazioni.
+    /// La password veniva usata così com'era (senza normalizzazione): proviamo prima
+    /// quella e poi la versione NFC.
+    private static func unwrapLegacy(_ wrapped: Data, password: String) throws -> Data {
+
+        let magicLength = wrapMagicV1.count
+
+        guard wrapped.count >= magicLength + saltLength + nonceLength + keyLength + tagLength else {
+            throw VaultCryptoError.invalidFile
+        }
+
+        let bytes = Array(wrapped)
+
+        let salt = Data(bytes[magicLength ..< magicLength + saltLength])
+        let nonceStart = magicLength + saltLength
+        let nonceData = Data(bytes[nonceStart ..< nonceStart + nonceLength])
+        let body = Data(bytes[(nonceStart + nonceLength)...])
+
+        let ciphertext = Data(body.prefix(body.count - tagLength))
+        let tag = Data(body.suffix(tagLength))
+
+        var candidates = [password]
+
+        let nfc = normalized(password)
+
+        if nfc != password {
+            candidates.append(nfc)
+        }
+
+        for candidate in candidates {
+
+            guard let key = try? deriveKey(password: candidate, salt: salt),
+                  let nonce = try? AES.GCM.Nonce(data: nonceData),
+                  let box = try? AES.GCM.SealedBox(nonce: nonce, ciphertext: ciphertext, tag: tag),
+                  let masterKey = try? AES.GCM.open(box, using: key),
+                  masterKey.count == keyLength
+            else {
+                continue
+            }
+
+            return masterKey
+        }
+
+        throw VaultCryptoError.authenticationFailed
+    }
+
+    // MARK: - Recovery key wrapping
+
+    static let recoveryKeyLength = 32
+
+    private static let recoveryMagic = Data("VLRK01".utf8)
+
+    /// Chiave di recupero: un segreto casuale da 256 bit (non una password), quindi
+    /// basta HKDF. Formato: [magic "VLRK01" 6][salt 16][nonce 12][ciphertext 32][tag 16].
+    static func wrapMasterKey(_ masterKey: Data, recoverySecret: Data) throws -> Data {
+
+        guard masterKey.count == keyLength,
+              recoverySecret.count == recoveryKeyLength
+        else {
+            throw VaultCryptoError.invalidFile
+        }
+
+        let salt = try randomBytes(count: saltLength)
+
+        var header = recoveryMagic
+        header.append(salt)
+
+        let key = recoveryWrapKey(secret: recoverySecret, salt: salt)
+
+        let nonceData = try randomBytes(count: nonceLength)
+        let nonce = try AES.GCM.Nonce(data: nonceData)
+
+        let sealed = try AES.GCM.seal(
+            masterKey,
+            using: key,
+            nonce: nonce,
+            authenticating: header
+        )
+
+        var result = header
+        result.append(nonceData)
+        result.append(sealed.ciphertext)
+        result.append(sealed.tag)
+        return result
+    }
+
+    static func unwrapMasterKey(_ wrapped: Data, recoverySecret: Data) throws -> Data {
+
+        let magicLength = recoveryMagic.count
+        let headerLength = magicLength + saltLength
+
+        guard recoverySecret.count == recoveryKeyLength,
+              wrapped.starts(with: recoveryMagic),
+              wrapped.count >= headerLength + nonceLength + keyLength + tagLength
+        else {
+            throw VaultCryptoError.invalidFile
+        }
+
+        let bytes = Array(wrapped)
+
+        let header = Data(bytes[0 ..< headerLength])
+        let salt = Data(bytes[magicLength ..< headerLength])
+        let nonceData = Data(bytes[headerLength ..< headerLength + nonceLength])
+        let body = Data(bytes[(headerLength + nonceLength)...])
+
+        let ciphertext = Data(body.prefix(body.count - tagLength))
+        let tag = Data(body.suffix(tagLength))
+
+        do {
+
+            let key = recoveryWrapKey(secret: recoverySecret, salt: salt)
+            let nonce = try AES.GCM.Nonce(data: nonceData)
+
+            let box = try AES.GCM.SealedBox(
+                nonce: nonce,
+                ciphertext: ciphertext,
+                tag: tag
+            )
+
+            let masterKey = try AES.GCM.open(
+                box,
+                using: key,
+                authenticating: header
+            )
+
+            guard masterKey.count == keyLength else {
+                throw VaultCryptoError.invalidFile
+            }
+
+            return masterKey
+
+        } catch VaultCryptoError.invalidFile {
+            throw VaultCryptoError.invalidFile
+        } catch {
+            throw VaultCryptoError.authenticationFailed
+        }
+    }
+
+    private static func recoveryWrapKey(secret: Data, salt: Data) -> SymmetricKey {
+
+        HKDF<SHA256>.deriveKey(
+            inputKeyMaterial: SymmetricKey(data: secret),
+            salt: salt,
+            info: Data("VaultX recovery key v1".utf8),
+            outputByteCount: keyLength
+        )
     }
 }
