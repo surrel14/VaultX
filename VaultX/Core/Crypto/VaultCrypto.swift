@@ -277,12 +277,20 @@ struct VaultCrypto {
         let ciphertext = Data(body.prefix(body.count - tagLength))
         let tag = Data(body.suffix(tagLength))
 
-        var candidates = [password]
+        // Candidati: la password così com'è, in forma NFC e in forma NFD.
+        // Attenzione: in Swift due stringhe canonicamente equivalenti sono "uguali"
+        // anche se hanno byte diversi, quindi i duplicati si scartano confrontando i byte UTF-8.
+        var candidates: [String] = []
+        var seen = Set<[UInt8]>()
 
-        let nfc = normalized(password)
+        let variants = [
+            password,
+            normalized(password),
+            password.decomposedStringWithCanonicalMapping
+        ]
 
-        if nfc != password {
-            candidates.append(nfc)
+        for variant in variants where seen.insert(Array(variant.utf8)).inserted {
+            candidates.append(variant)
         }
 
         for candidate in candidates {
