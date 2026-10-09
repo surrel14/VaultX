@@ -16,6 +16,12 @@ struct UnlockVaultView: View {
     @State private var didAutoPrompt = false
     @State private var hasRecoveryKey = false
     @State private var showingReset = false
+
+    // Aggiornamento dei vault nel vecchio formato
+    @State private var legacySession: VaultSession?
+    @State private var showingMigrationConfirm = false
+    @State private var isMigrating = false
+    @StateObject private var migration = MigrationProgress()
     @State private var errorMessage: String?
     @State private var showingError = false
 
@@ -133,20 +139,51 @@ struct UnlockVaultView: View {
         }
         .navigationTitle("Sblocca vault")
         .navigationBarTitleDisplayMode(.inline)
+        .interactiveDismissDisabled(isUnlocking || isMigrating)
+        .overlay {
+            migrationOverlay
+        }
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
                 Button("Annulla") {
                     dismiss()
                 }
+                .disabled(isMigrating)
             }
         }
-        .alert(
-            "Sblocco non riuscito",
-            isPresented: $showingError
-        ) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(errorMessage ?? "")
+        .background {
+
+            ZStack {
+
+                Color.clear
+                    .alert(
+                        "Sblocco non riuscito",
+                        isPresented: $showingError
+                    ) {
+                        Button("OK", role: .cancel) {}
+                    } message: {
+                        Text(errorMessage ?? "")
+                    }
+
+                Color.clear
+                    .alert(
+                        "Aggiornare il vault?",
+                        isPresented: $showingMigrationConfirm
+                    ) {
+
+                        Button("Aggiorna") {
+                            startMigration()
+                        }
+
+                        Button("Annulla", role: .cancel) {
+                            cancelMigration()
+                        }
+
+                    } message: {
+                        Text("Questo vault usa il formato precedente. Per continuare va aggiornato al nuovo formato, che cifra anche i nomi di file e cartelle e supporta i file di grandi dimensioni. La password non cambia. L'operazione ricifra tutti i file e non è reversibile: può richiedere un po' di tempo, tieni l'app aperta.")
+                    }
+            }
+            .allowsHitTesting(false)
         }
         .sheet(isPresented: $showingReset) {
 
@@ -262,9 +299,24 @@ struct UnlockVaultView: View {
 
     // MARK: - Helpers
 
+    /// Sblocco riuscito: se il vault è nel vecchio formato prima va aggiornato.
     private func finish(with session: VaultSession) {
 
         isUnlocking = false
+
+        if session.isLegacy {
+
+            legacySession = session
+            showingMigrationConfirm = true
+
+            return
+        }
+
+        complete(with: session)
+    }
+
+    private func complete(with session: VaultSession) {
+
         password = ""
 
         onUnlocked(session)
@@ -272,9 +324,115 @@ struct UnlockVaultView: View {
         dismiss()
     }
 
+    // MARK: - Migration
+
+    private func startMigration() {
+
+        guard let session = legacySession else {
+            return
+        }
+
+        isMigrating = true
+        migration.update(done: 0, total: 0)
+
+        let tracker = migration
+
+        Task { @MainActor in
+
+            do {
+
+                try await Task.detached(priority: .userInitiated) {
+
+                    try session.migrateFromLegacy { done, total in
+                        tracker.update(done: done, total: total)
+                    }
+
+                }.value
+
+                isMigrating = false
+                legacySession = nil
+
+                complete(with: session)
+
+            } catch {
+
+                isMigrating = false
+                legacySession = nil
+
+                session.lock()
+
+                present(error.localizedDescription)
+            }
+        }
+    }
+
+    private func cancelMigration() {
+
+        legacySession?.lock()
+        legacySession = nil
+    }
+
+    @ViewBuilder
+    private var migrationOverlay: some View {
+
+        if isMigrating {
+
+            ZStack {
+
+                Color.black
+                    .opacity(0.35)
+                    .ignoresSafeArea()
+
+                VStack(spacing: 14) {
+
+                    ProgressView(
+                        value: Double(migration.done),
+                        total: Double(max(migration.total, 1))
+                    )
+
+                    Text("Aggiornamento del vault…")
+                        .font(.headline)
+
+                    Text(
+                        migration.total > 0
+                            ? "\(migration.done) di \(migration.total) file"
+                            : "Preparazione…"
+                    )
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                }
+                .padding(24)
+                .frame(maxWidth: 280)
+                .background(
+                    .regularMaterial,
+                    in: RoundedRectangle(cornerRadius: 16)
+                )
+            }
+        }
+    }
+
     private func present(_ message: String) {
 
         errorMessage = message
         showingError = true
+    }
+}
+
+
+// MARK: - Migration progress
+
+/// Raccoglie l'avanzamento della migrazione (chiamato da un thread in background)
+/// e lo pubblica sul main thread per la UI.
+final class MigrationProgress: ObservableObject, @unchecked Sendable {
+
+    @Published private(set) var done = 0
+    @Published private(set) var total = 0
+
+    func update(done: Int, total: Int) {
+
+        DispatchQueue.main.async {
+            self.done = done
+            self.total = total
+        }
     }
 }

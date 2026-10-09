@@ -6,13 +6,17 @@ import PDFKit
 
 // MARK: - Vault Item
 
-/// Un elemento del vault: un file cifrato (`nome.ext.vltx`) oppure una cartella.
+/// Un elemento del vault visto dall'interfaccia: un file o una cartella.
+///
+/// `url` è un identificatore stabile: per i file è il percorso reale del file cifrato
+/// (`files/<ID>.vltx`), per le cartelle un percorso "virtuale" (`files/<ID>`) che non
+/// esiste su disco. Rinominare o spostare un elemento non cambia mai il suo `url`.
 struct VaultItem: Identifiable, Hashable {
 
     let url: URL
     let isFolder: Bool
 
-    /// Nome originale (senza `.vltx`).
+    /// Nome originale (vive solo nell'indice cifrato).
     let name: String
 
     /// Dimensione del contenuto in chiaro (0 per le cartelle).
@@ -29,22 +33,53 @@ struct VaultItem: Identifiable, Hashable {
 
 // MARK: - Vault Session
 
-/// Sessione di un vault sbloccato.
+/// Sessione di un vault sbloccato (formato v3).
 ///
-/// La master key è tenuta in un buffer allocato a mano che viene AZZERATO
-/// (`memset_s`) e liberato da `lock()`. Per ogni operazione si crea una
-/// `SymmetricKey` temporanea, che CryptoKit azzera quando viene rilasciata.
+/// - La master key è tenuta in un buffer allocato a mano che viene AZZERATO
+///   (`memset_s`) e liberato da `lock()`. Per ogni operazione si crea una
+///   `SymmetricKey` temporanea, che CryptoKit azzera quando viene rilasciata.
+/// - Nomi, cartelle e struttura stanno nell'indice cifrato (`index.vaultx`);
+///   su disco restano solo file `files/<ID>.vltx` con nomi casuali.
 final class VaultSession: @unchecked Sendable {
 
     let vaultURL: URL
     let manifest: VaultManifest
 
+    // Chiave
     private let stateLock = NSLock()
     private var keyBuffer: UnsafeMutableRawBufferPointer?
+
+    // Indice (protetto da indexLock; ricorsivo perché le operazioni si annidano)
+    let indexLock = NSRecursiveLock()
+    private var index: VaultIndex?
+    private var legacy: Bool
+    private var indexLoadedFromBackup = false
+
     private let thumbnailCache = NSCache<NSString, UIImage>()
 
+    // MARK: Paths
+
+    /// Cartella piatta con i file cifrati (v3).
+    var contentDirectory: URL {
+        vaultURL.appendingPathComponent("files", isDirectory: true)
+    }
+
+    /// Radice (virtuale) del vault: coincide con la cartella dei file cifrati.
     var rootDirectory: URL {
+        contentDirectory
+    }
+
+    /// Cartella con nomi in chiaro dei vault v0.2 (solo per la migrazione).
+    var legacyDataDirectory: URL {
         vaultURL.appendingPathComponent("data", isDirectory: true)
+    }
+
+    private var indexURL: URL {
+        vaultURL.appendingPathComponent("index.vaultx")
+    }
+
+    private var indexBackupURL: URL {
+        vaultURL.appendingPathComponent("index.vaultx.bak")
     }
 
     init(
@@ -55,6 +90,10 @@ final class VaultSession: @unchecked Sendable {
 
         self.vaultURL = vaultURL
         self.manifest = manifest
+
+        self.legacy = !FileManager.default.fileExists(
+            atPath: vaultURL.appendingPathComponent("index.vaultx").path
+        )
 
         let buffer = UnsafeMutableRawBufferPointer.allocate(
             byteCount: masterKey.count,
@@ -85,11 +124,24 @@ final class VaultSession: @unchecked Sendable {
         return keyBuffer == nil
     }
 
-    /// Blocca il vault: azzera la chiave in memoria, svuota la cache delle
-    /// anteprime ed elimina le copie in chiaro in tmp.
+    /// `true` se il vault usa ancora il formato v0.2 e va aggiornato (`migrateFromLegacy`).
+    var isLegacy: Bool {
+
+        indexLock.lock()
+        defer { indexLock.unlock() }
+
+        return legacy
+    }
+
+    /// Blocca il vault: azzera la chiave in memoria, dimentica l'indice (nomi),
+    /// svuota la cache delle anteprime ed elimina le copie in chiaro in tmp.
     func lock() {
 
         wipeKey()
+
+        indexLock.lock()
+        index = nil
+        indexLock.unlock()
 
         thumbnailCache.removeAllObjects()
 
@@ -113,7 +165,7 @@ final class VaultSession: @unchecked Sendable {
         keyBuffer = nil
     }
 
-    private func requireUnlocked() throws {
+    func requireUnlocked() throws {
 
         stateLock.lock()
         defer { stateLock.unlock() }
@@ -123,7 +175,7 @@ final class VaultSession: @unchecked Sendable {
         }
     }
 
-    private func makeKey() throws -> SymmetricKey {
+    func makeKey() throws -> SymmetricKey {
 
         stateLock.lock()
         defer { stateLock.unlock() }
@@ -162,6 +214,7 @@ final class VaultSession: @unchecked Sendable {
 
     // MARK: - Names
 
+    /// Nome originale di un file del vecchio formato ("foto.jpg.vltx" -> "foto.jpg").
     static func originalName(of encryptedURL: URL) -> String {
 
         encryptedURL.pathExtension.lowercased() == "vltx"
@@ -203,140 +256,290 @@ final class VaultSession: @unchecked Sendable {
         return cleaned
     }
 
-    // MARK: - Location checks
+    // MARK: - URL <-> node
 
-    private func isInsideVault(_ url: URL) -> Bool {
-
-        let root = rootDirectory.resolvingSymlinksInPath().path
-        let path = url.resolvingSymlinksInPath().path
-
-        return path == root || path.hasPrefix(root + "/")
+    func fileURL(for id: UUID) -> URL {
+        contentDirectory.appendingPathComponent(id.uuidString + ".vltx")
     }
 
-    private func isRoot(_ url: URL) -> Bool {
+    private func url(for node: VaultNode) -> URL {
 
-        url.resolvingSymlinksInPath().path
-            == rootDirectory.resolvingSymlinksInPath().path
+        node.isFolder
+            ? contentDirectory.appendingPathComponent(node.id.uuidString, isDirectory: true)
+            : fileURL(for: node.id)
+    }
+
+    /// ID del nodo a cui si riferisce l'URL; `nil` per la radice.
+    private func nodeID(for url: URL) throws -> UUID? {
+
+        let content = contentDirectory.standardizedFileURL.path
+
+        if url.standardizedFileURL.path == content {
+            return nil
+        }
+
+        guard url.deletingLastPathComponent().standardizedFileURL.path == content else {
+            throw VaultStoreError.invalidLocation
+        }
+
+        var name = url.lastPathComponent
+
+        if name.lowercased().hasSuffix(".vltx") {
+            name = String(name.dropLast(5))
+        }
+
+        guard let id = UUID(uuidString: name) else {
+            throw VaultStoreError.invalidLocation
+        }
+
+        return id
+    }
+
+    private static func requireFolder(
+        _ id: UUID?,
+        in index: VaultIndex
+    ) throws {
+
+        guard let id else {
+            return
+        }
+
+        guard let node = index.nodes[id], node.isFolder else {
+            throw VaultStoreError.invalidLocation
+        }
+    }
+
+    private func makeItem(_ node: VaultNode) -> VaultItem {
+
+        VaultItem(
+            url: url(for: node),
+            isFolder: node.isFolder,
+            name: node.name,
+            size: node.size,
+            modified: node.modified
+        )
+    }
+
+    /// Nome da mostrare per una cartella (o per la radice).
+    func displayName(for url: URL) -> String {
+
+        guard let id = try? nodeID(for: url) else {
+            return manifest.name
+        }
+
+        let name: String? = try? withIndex { index in
+            index.nodes[id]?.name
+        }
+
+        return name ?? manifest.name
+    }
+
+    // MARK: - Index (load / save)
+
+    private func readIndexFile(
+        at url: URL,
+        key: SymmetricKey
+    ) throws -> VaultIndex {
+
+        let encrypted = try Data(contentsOf: url)
+
+        let plain = try VaultCrypto.decrypt(
+            encrypted,
+            using: VaultCrypto.indexKey(masterKey: key)
+        )
+
+        return try VaultIndex(serialized: plain)
+    }
+
+    /// Da chiamare con `indexLock` acquisito.
+    private func loadIndexLocked() throws {
+
+        if legacy {
+            throw VaultStoreError.migrationRequired
+        }
+
+        if index != nil {
+            return
+        }
+
+        let key = try makeKey()
+
+        do {
+
+            index = try readIndexFile(at: indexURL, key: key)
+            indexLoadedFromBackup = false
+
+        } catch {
+
+            // Indice principale illeggibile: si prova la copia precedente.
+            guard let backup = try? readIndexFile(at: indexBackupURL, key: key) else {
+                throw error
+            }
+
+            index = backup
+            indexLoadedFromBackup = true
+        }
+    }
+
+    /// Da chiamare con `indexLock` acquisito.
+    func saveIndexLocked(_ model: VaultIndex) throws {
+
+        let key = try makeKey()
+
+        let encrypted = try VaultCrypto.encrypt(
+            try model.serialized(),
+            using: VaultCrypto.indexKey(masterKey: key)
+        )
+
+        let fileManager = FileManager.default
+
+        // Copia di sicurezza della versione precedente (ma non se l'indice principale
+        // era illeggibile: si perderebbe l'unica copia buona).
+        if !indexLoadedFromBackup, fileManager.fileExists(atPath: indexURL.path) {
+
+            try? fileManager.removeItem(at: indexBackupURL)
+            try? fileManager.copyItem(at: indexURL, to: indexBackupURL)
+        }
+
+        try encrypted.write(
+            to: indexURL,
+            options: [.atomic, .completeFileProtection]
+        )
+
+        indexLoadedFromBackup = false
+    }
+
+    /// Lettura dell'indice (con il lock).
+    private func withIndex<T>(
+        _ body: (VaultIndex) throws -> T
+    ) throws -> T {
+
+        try requireUnlocked()
+
+        indexLock.lock()
+        defer { indexLock.unlock() }
+
+        try loadIndexLocked()
+
+        guard let current = index else {
+            throw VaultStoreError.locked
+        }
+
+        return try body(current)
+    }
+
+    /// Modifica dell'indice: si lavora su una copia e la si salva (cifrata) prima
+    /// di renderla attiva, così un errore non lascia l'indice a metà.
+    private func mutateIndex<T>(
+        _ body: (inout VaultIndex) throws -> T
+    ) throws -> T {
+
+        try requireUnlocked()
+
+        indexLock.lock()
+        defer { indexLock.unlock() }
+
+        try loadIndexLocked()
+
+        guard var copy = index else {
+            throw VaultStoreError.locked
+        }
+
+        let result = try body(&copy)
+
+        try saveIndexLocked(copy)
+
+        index = copy
+
+        return result
+    }
+
+    /// Imposta l'indice dopo la migrazione (con `indexLock` già acquisito).
+    func adoptMigratedIndexLocked(_ model: VaultIndex) {
+
+        index = model
+        legacy = false
+        indexLoadedFromBackup = false
+    }
+
+    // MARK: - Open
+
+    /// Da chiamare subito dopo lo sblocco: carica (e quindi verifica) l'indice
+    /// ed elimina i file orfani. Per i vault v0.2 non fa nulla.
+    func prepare() throws {
+
+        if isLegacy {
+            return
+        }
+
+        _ = try withIndex { $0.nodes.count }
+
+        try ensureContentDirectory()
+
+        removeOrphans()
+    }
+
+    func ensureContentDirectory() throws {
+
+        if !FileManager.default.fileExists(atPath: contentDirectory.path) {
+
+            try FileManager.default.createDirectory(
+                at: contentDirectory,
+                withIntermediateDirectories: true,
+                attributes: [.protectionKey: FileProtectionType.complete]
+            )
+        }
+    }
+
+    /// Elimina da `files/` ciò che l'indice non conosce (import o eliminazioni
+    /// interrotti, residui). Non si tocca nulla se l'indice è stato recuperato
+    /// dalla copia di sicurezza: potrebbe essere indietro rispetto ai file.
+    private func removeOrphans() {
+
+        indexLock.lock()
+        let fromBackup = indexLoadedFromBackup
+        indexLock.unlock()
+
+        guard !fromBackup else {
+            return
+        }
+
+        guard let known = try? withIndex({ index in
+
+            Set(
+                index.nodes.values
+                    .filter { !$0.isFolder }
+                    .map { $0.id.uuidString + ".vltx" }
+            )
+
+        }) else {
+            return
+        }
+
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: contentDirectory,
+            includingPropertiesForKeys: nil,
+            options: []
+        ) else {
+            return
+        }
+
+        for entry in entries where !known.contains(entry.lastPathComponent) {
+            try? SecureDelete.remove(at: entry)
+        }
     }
 
     // MARK: - Listing
 
     func items(in directory: URL) throws -> [VaultItem] {
 
-        try requireUnlocked()
+        let parent = try nodeID(for: directory)
 
-        guard isInsideVault(directory) else {
-            throw VaultStoreError.invalidLocation
-        }
+        return try withIndex { index in
 
-        let fileManager = FileManager.default
+            try Self.requireFolder(parent, in: index)
 
-        if isRoot(directory), !fileManager.fileExists(atPath: directory.path) {
-            try fileManager.createDirectory(
-                at: directory,
-                withIntermediateDirectories: true
-            )
-        }
-
-        let keys: [URLResourceKey] = [
-            .isDirectoryKey,
-            .fileSizeKey,
-            .contentModificationDateKey
-        ]
-
-        let urls = try fileManager.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: keys,
-            options: []
-        )
-
-        var result: [VaultItem] = []
-
-        for url in urls {
-
-            let values = try? url.resourceValues(forKeys: Set(keys))
-
-            if values?.isDirectory == true {
-
-                result.append(
-                    VaultItem(
-                        url: url,
-                        isFolder: true,
-                        name: url.lastPathComponent,
-                        size: 0,
-                        modified: values?.contentModificationDate
-                    )
-                )
-
-            } else if url.pathExtension.lowercased() == "vltx" {
-
-                let encryptedSize = Int64(values?.fileSize ?? 0)
-
-                result.append(
-                    VaultItem(
-                        url: url,
-                        isFolder: false,
-                        name: Self.originalName(of: url),
-                        size: max(0, encryptedSize - Int64(VaultCrypto.envelopeOverhead)),
-                        modified: values?.contentModificationDate
-                    )
-                )
-            }
-        }
-
-        return result
-    }
-
-    private func nameExists(
-        _ name: String,
-        in directory: URL,
-        excluding excluded: URL? = nil
-    ) -> Bool {
-
-        guard let existing = try? items(in: directory) else {
-            return false
-        }
-
-        return existing.contains { item in
-
-            if let excluded,
-               item.url.standardizedFileURL.path
-                == excluded.standardizedFileURL.path {
-                return false
-            }
-
-            return item.name.caseInsensitiveCompare(name) == .orderedSame
-        }
-    }
-
-    /// "foto.jpg" -> "foto (1).jpg" se esiste già.
-    private func uniqueName(
-        for name: String,
-        isFolder: Bool,
-        in directory: URL
-    ) -> String {
-
-        guard nameExists(name, in: directory) else {
-            return name
-        }
-
-        let nsName = name as NSString
-        let ext = isFolder ? "" : nsName.pathExtension
-        let base = isFolder ? name : nsName.deletingPathExtension
-
-        var counter = 1
-
-        while true {
-
-            let candidate = ext.isEmpty
-                ? "\(base) (\(counter))"
-                : "\(base) (\(counter)).\(ext)"
-
-            if !nameExists(candidate, in: directory) {
-                return candidate
-            }
-
-            counter += 1
+            return index.children(of: parent).map { makeItem($0) }
         }
     }
 
@@ -348,102 +551,101 @@ final class VaultSession: @unchecked Sendable {
         in directory: URL
     ) throws -> URL {
 
-        try requireUnlocked()
-
-        guard isInsideVault(directory) else {
-            throw VaultStoreError.invalidLocation
-        }
-
         let clean = try Self.validatedName(name)
+        let parent = try nodeID(for: directory)
 
-        guard !nameExists(clean, in: directory) else {
-            throw VaultStoreError.itemAlreadyExists
+        return try mutateIndex { index in
+
+            try Self.requireFolder(parent, in: index)
+
+            guard !index.nameExists(clean, in: parent) else {
+                throw VaultStoreError.itemAlreadyExists
+            }
+
+            let now = Date()
+
+            let node = VaultNode(
+                id: UUID(),
+                parentID: parent,
+                name: clean,
+                isFolder: true,
+                size: 0,
+                created: now,
+                modified: now
+            )
+
+            index.nodes[node.id] = node
+
+            return url(for: node)
         }
-
-        let url = directory.appendingPathComponent(
-            clean,
-            isDirectory: true
-        )
-
-        try FileManager.default.createDirectory(
-            at: url,
-            withIntermediateDirectories: false
-        )
-
-        return url
     }
 
     // MARK: - Rename
 
+    /// Rinominare cambia solo l'indice: i file su disco non si toccano.
     @discardableResult
     func renameItem(
         _ item: VaultItem,
         to newName: String
     ) throws -> URL {
 
-        try requireUnlocked()
-
-        guard isInsideVault(item.url), !isRoot(item.url) else {
-            throw VaultStoreError.invalidLocation
-        }
-
         let clean = try Self.validatedName(newName)
 
-        if clean == item.name {
-            return item.url
+        return try mutateIndex { index in
+
+            guard let id = try nodeID(for: item.url),
+                  var node = index.nodes[id]
+            else {
+                throw VaultStoreError.invalidLocation
+            }
+
+            if node.name == clean {
+                return url(for: node)
+            }
+
+            guard !index.nameExists(clean, in: node.parentID, excluding: id) else {
+                throw VaultStoreError.itemAlreadyExists
+            }
+
+            node.name = clean
+            index.nodes[id] = node
+
+            return url(for: node)
         }
-
-        let directory = item.url.deletingLastPathComponent()
-
-        guard !nameExists(clean, in: directory, excluding: item.url) else {
-            throw VaultStoreError.itemAlreadyExists
-        }
-
-        let destination = directory.appendingPathComponent(
-            item.isFolder ? clean : clean + ".vltx",
-            isDirectory: item.isFolder
-        )
-
-        try FileManager.default.moveItem(
-            at: item.url,
-            to: destination
-        )
-
-        return destination
     }
 
     // MARK: - Move
 
-    func canMove(
+    private func canMove(
         _ item: VaultItem,
-        to folder: URL
-    ) -> Bool {
+        to folder: URL,
+        in index: VaultIndex
+    ) throws -> Bool {
 
-        guard isInsideVault(item.url),
-              !isRoot(item.url),
-              isInsideVault(folder)
+        guard let id = try nodeID(for: item.url),
+              let node = index.nodes[id]
         else {
             return false
         }
 
-        let target = folder.resolvingSymlinksInPath().path
+        let target = try nodeID(for: folder)
 
-        let parent = item.url
-            .deletingLastPathComponent()
-            .resolvingSymlinksInPath()
-            .path
+        if let target {
+
+            guard let targetNode = index.nodes[target], targetNode.isFolder else {
+                return false
+            }
+        }
 
         // Già nella cartella di destinazione.
-        if target == parent {
+        if node.parentID == target {
             return false
         }
 
         // Una cartella non può finire dentro se stessa o in un suo discendente.
-        if item.isFolder {
+        if node.isFolder, let target {
 
-            let source = item.url.resolvingSymlinksInPath().path
-
-            if target == source || target.hasPrefix(source + "/") {
+            if target == id || index.isDescendant(target, of: id) {
                 return false
             }
         }
@@ -451,35 +653,14 @@ final class VaultSession: @unchecked Sendable {
         return true
     }
 
-    @discardableResult
-    func moveItem(
+    func canMove(
         _ item: VaultItem,
         to folder: URL
-    ) throws -> URL {
+    ) -> Bool {
 
-        try requireUnlocked()
-
-        guard canMove(item, to: folder) else {
-            throw VaultStoreError.invalidMove
-        }
-
-        let name = uniqueName(
-            for: item.name,
-            isFolder: item.isFolder,
-            in: folder
-        )
-
-        let destination = folder.appendingPathComponent(
-            item.isFolder ? name : name + ".vltx",
-            isDirectory: item.isFolder
-        )
-
-        try FileManager.default.moveItem(
-            at: item.url,
-            to: destination
-        )
-
-        return destination
+        (try? withIndex { index in
+            try canMove(item, to: folder, in: index)
+        }) ?? false
     }
 
     /// Quanti degli elementi possono essere spostati nella cartella indicata.
@@ -489,6 +670,40 @@ final class VaultSession: @unchecked Sendable {
     ) -> Int {
 
         items.filter { canMove($0, to: folder) }.count
+    }
+
+    @discardableResult
+    func moveItem(
+        _ item: VaultItem,
+        to folder: URL
+    ) throws -> URL {
+
+        try mutateIndex { index in
+
+            guard try canMove(item, to: folder, in: index) else {
+                throw VaultStoreError.invalidMove
+            }
+
+            guard let id = try nodeID(for: item.url),
+                  var node = index.nodes[id]
+            else {
+                throw VaultStoreError.invalidLocation
+            }
+
+            let target = try nodeID(for: folder)
+
+            node.name = index.uniqueName(
+                for: node.name,
+                isFolder: node.isFolder,
+                in: target
+            )
+
+            node.parentID = target
+
+            index.nodes[id] = node
+
+            return url(for: node)
+        }
     }
 
     /// Sposta più elementi. Quelli che non si possono spostare (già nella cartella,
@@ -517,19 +732,59 @@ final class VaultSession: @unchecked Sendable {
     /// (verrebbero spostati/eliminati insieme alla cartella).
     private func topLevel(_ items: [VaultItem]) -> [VaultItem] {
 
-        let folderPaths = items
-            .filter { $0.isFolder }
-            .map { $0.url.resolvingSymlinksInPath().path }
+        let selected = Set(items.compactMap { try? nodeID(for: $0.url) })
 
-        return items.filter { item in
+        let result = try? withIndex { index in
 
-            let path = item.url.resolvingSymlinksInPath().path
+            items.filter { item in
 
-            return !folderPaths.contains { path.hasPrefix($0 + "/") }
+                guard let id = try? nodeID(for: item.url) else {
+                    return true
+                }
+
+                return !selected.contains { ancestor in
+                    index.isDescendant(id, of: ancestor)
+                }
+            }
         }
+
+        return result ?? items
     }
 
     // MARK: - Delete
+
+    /// Elimina un file o una cartella (con tutto il contenuto). Prima si aggiorna
+    /// l'indice, poi i file cifrati vengono sovrascritti con dati casuali (best
+    /// effort) e rimossi. Se qualcosa si interrompe, i residui vengono ripuliti
+    /// al prossimo sblocco.
+    func deleteItem(_ item: VaultItem) throws {
+
+        let removedFiles: [UUID] = try mutateIndex { index in
+
+            guard let id = try nodeID(for: item.url),
+                  index.nodes[id] != nil
+            else {
+                throw VaultStoreError.invalidLocation
+            }
+
+            var files: [UUID] = []
+
+            for current in index.subtree(of: id) {
+
+                if let node = index.nodes[current], !node.isFolder {
+                    files.append(current)
+                }
+
+                index.nodes[current] = nil
+            }
+
+            return files
+        }
+
+        for id in removedFiles {
+            try? SecureDelete.remove(at: fileURL(for: id))
+        }
+    }
 
     /// Elimina più elementi. Restituisce un messaggio per ogni errore.
     func deleteItems(_ items: [VaultItem]) -> [String] {
@@ -548,19 +803,6 @@ final class VaultSession: @unchecked Sendable {
         return failures
     }
 
-    /// Elimina un file o una cartella (con tutto il contenuto): sovrascrive i
-    /// file con dati casuali (best effort) e poi li rimuove.
-    func deleteItem(_ item: VaultItem) throws {
-
-        try requireUnlocked()
-
-        guard isInsideVault(item.url), !isRoot(item.url) else {
-            throw VaultStoreError.invalidLocation
-        }
-
-        try SecureDelete.remove(at: item.url)
-    }
-
     // MARK: - Import
 
     @discardableResult
@@ -571,11 +813,19 @@ final class VaultSession: @unchecked Sendable {
 
         try requireUnlocked()
 
-        guard isInsideVault(directory) else {
-            throw VaultStoreError.invalidLocation
+        let parent = try nodeID(for: directory)
+
+        try withIndex { index in
+            try Self.requireFolder(parent, in: index)
         }
 
         let key = try makeKey()
+
+        try ensureContentDirectory()
+
+        let id = UUID()
+        let finalURL = fileURL(for: id)
+        let partURL = finalURL.appendingPathExtension("part")
 
         let accessed = sourceURL.startAccessingSecurityScopedResource()
 
@@ -585,30 +835,67 @@ final class VaultSession: @unchecked Sendable {
             }
         }
 
-        let clearData = try Data(
-            contentsOf: sourceURL,
-            options: .mappedIfSafe
-        )
+        let modified = (
+            try? sourceURL.resourceValues(forKeys: [.contentModificationDateKey])
+        )?.contentModificationDate ?? Date()
 
-        let encrypted = try VaultCrypto.encrypt(
-            clearData,
-            using: key
-        )
+        let proposedName = Self.sanitizedImportName(sourceURL.lastPathComponent)
 
-        let name = uniqueName(
-            for: Self.sanitizedImportName(sourceURL.lastPathComponent),
-            isFolder: false,
-            in: directory
-        )
+        let fileManager = FileManager.default
 
-        let destination = directory.appendingPathComponent(name + ".vltx")
+        // Cifratura a blocchi: la memoria usata non dipende dalla dimensione del file.
+        let size: Int64
 
-        try encrypted.write(
-            to: destination,
-            options: [.atomic, .completeFileProtection]
-        )
+        do {
 
-        return destination
+            size = try VaultCrypto.encryptFile(
+                from: sourceURL,
+                to: partURL,
+                fileID: id,
+                masterKey: key
+            )
+
+            try fileManager.moveItem(at: partURL, to: finalURL)
+
+        } catch {
+
+            try? fileManager.removeItem(at: partURL)
+            try? fileManager.removeItem(at: finalURL)
+
+            throw error
+        }
+
+        do {
+
+            try mutateIndex { index in
+
+                try Self.requireFolder(parent, in: index)
+
+                let name = index.uniqueName(
+                    for: proposedName,
+                    isFolder: false,
+                    in: parent
+                )
+
+                index.nodes[id] = VaultNode(
+                    id: id,
+                    parentID: parent,
+                    name: name,
+                    isFolder: false,
+                    size: size,
+                    created: Date(),
+                    modified: modified
+                )
+            }
+
+        } catch {
+
+            try? fileManager.removeItem(at: finalURL)
+
+            throw error
+        }
+
+        return finalURL
     }
 
     /// Cifra più file. Restituisce un messaggio per ogni file non importato
@@ -677,23 +964,19 @@ final class VaultSession: @unchecked Sendable {
     /// nome originale (serve ad anteprima e condivisione).
     func decryptToTemporaryFile(_ encryptedURL: URL) throws -> URL {
 
-        try requireUnlocked()
+        let (id, name): (UUID, String) = try withIndex { index in
 
-        guard isInsideVault(encryptedURL) else {
-            throw VaultStoreError.invalidLocation
+            guard let id = try nodeID(for: encryptedURL),
+                  let node = index.nodes[id],
+                  !node.isFolder
+            else {
+                throw VaultStoreError.invalidLocation
+            }
+
+            return (id, node.name)
         }
 
         let key = try makeKey()
-
-        let encrypted = try Data(
-            contentsOf: encryptedURL,
-            options: .mappedIfSafe
-        )
-
-        let clear = try VaultCrypto.decrypt(
-            encrypted,
-            using: key
-        )
 
         let directory = Self.openDirectory.appendingPathComponent(
             UUID().uuidString,
@@ -706,13 +989,13 @@ final class VaultSession: @unchecked Sendable {
             attributes: [.protectionKey: FileProtectionType.complete]
         )
 
-        let destination = directory.appendingPathComponent(
-            Self.originalName(of: encryptedURL)
-        )
+        let destination = directory.appendingPathComponent(name)
 
-        try clear.write(
+        try VaultCrypto.decryptFile(
+            from: fileURL(for: id),
             to: destination,
-            options: [.atomic, .completeFileProtection]
+            fileID: id,
+            masterKey: key
         )
 
         return destination
@@ -770,8 +1053,10 @@ final class VaultSession: @unchecked Sendable {
     /// che viene svuotata al blocco del vault.
     func thumbnail(for item: VaultItem) -> UIImage? {
 
+        let limit = 25 * 1024 * 1024
+
         guard Self.supportsThumbnail(item),
-              item.size <= 25 * 1024 * 1024
+              item.size <= Int64(limit)
         else {
             return nil
         }
@@ -783,8 +1068,13 @@ final class VaultSession: @unchecked Sendable {
         }
 
         guard let key = try? makeKey(),
-              let encrypted = try? Data(contentsOf: item.url, options: .mappedIfSafe),
-              let clear = try? VaultCrypto.decrypt(encrypted, using: key)
+              let id = try? nodeID(for: item.url),
+              let clear = try? VaultCrypto.decryptToData(
+                from: fileURL(for: id),
+                fileID: id,
+                masterKey: key,
+                maximumSize: limit
+              )
         else {
             return nil
         }
@@ -840,5 +1130,225 @@ final class VaultSession: @unchecked Sendable {
             of: CGSize(width: 160, height: 160),
             for: .mediaBox
         )
+    }
+}
+
+// MARK: - Migration from the v0.2 format
+
+extension VaultSession {
+
+    /// Converte un vault v0.2 (nomi in chiaro, file cifrati interi) nel formato v3:
+    /// nomi e cartelle finiscono nell'indice cifrato, i file vengono ricifrati
+    /// a blocchi con chiavi per file.
+    ///
+    /// Il vecchio albero (`data/`) resta intatto finché l'indice nuovo non è stato
+    /// scritto: se qualcosa va storto (errore, crash, batteria) il vault resta
+    /// utilizzabile nel vecchio formato e si può riprovare.
+    func migrateFromLegacy(
+        progress: ((Int, Int) -> Void)? = nil
+    ) throws {
+
+        try requireUnlocked()
+
+        guard isLegacy else {
+            return
+        }
+
+        let key = try makeKey()
+        let fileManager = FileManager.default
+
+        let total = Self.countLegacyFiles(in: legacyDataDirectory)
+
+        // Residui di un tentativo precedente interrotto.
+        try? fileManager.removeItem(at: contentDirectory)
+
+        try fileManager.createDirectory(
+            at: contentDirectory,
+            withIntermediateDirectories: true,
+            attributes: [.protectionKey: FileProtectionType.complete]
+        )
+
+        var model = VaultIndex()
+        var done = 0
+
+        progress?(0, total)
+
+        do {
+
+            try migrateDirectory(
+                legacyDataDirectory,
+                parent: nil,
+                model: &model,
+                key: key,
+                done: &done,
+                total: total,
+                progress: progress
+            )
+
+        } catch {
+
+            try? fileManager.removeItem(at: contentDirectory)
+
+            throw error
+        }
+
+        // L'indice si scrive per ultimo: da questo momento il vault è v3.
+        indexLock.lock()
+        defer { indexLock.unlock() }
+
+        do {
+
+            try saveIndexLocked(model)
+
+        } catch {
+
+            try? fileManager.removeItem(at: contentDirectory)
+
+            throw error
+        }
+
+        adoptMigratedIndexLocked(model)
+
+        // Manifest aggiornato e rimozione del vecchio albero (nomi in chiaro).
+        try? writeManifest(version: 3, key: key)
+
+        try? fileManager.removeItem(at: legacyDataDirectory)
+    }
+
+    private func writeManifest(
+        version: Int,
+        key: SymmetricKey
+    ) throws {
+
+        let updated = VaultManifest(
+            version: version,
+            name: manifest.name,
+            createdAt: manifest.createdAt
+        )
+
+        let encrypted = try VaultCrypto.encrypt(
+            try JSONEncoder().encode(updated),
+            using: key
+        )
+
+        try encrypted.write(
+            to: vaultURL.appendingPathComponent("vault.manifest"),
+            options: [.atomic, .completeFileProtection]
+        )
+    }
+
+    private static func countLegacyFiles(in directory: URL) -> Int {
+
+        guard let enumerator = FileManager.default.enumerator(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ) else {
+            return 0
+        }
+
+        var count = 0
+
+        for case let url as URL in enumerator
+        where url.pathExtension.lowercased() == "vltx" {
+            count += 1
+        }
+
+        return count
+    }
+
+    private func migrateDirectory(
+        _ directory: URL,
+        parent: UUID?,
+        model: inout VaultIndex,
+        key: SymmetricKey,
+        done: inout Int,
+        total: Int,
+        progress: ((Int, Int) -> Void)?
+    ) throws {
+
+        let keys: [URLResourceKey] = [
+            .isDirectoryKey,
+            .contentModificationDateKey
+        ]
+
+        let entries = try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: keys,
+            options: []
+        )
+        .sorted {
+            $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent)
+                == .orderedAscending
+        }
+
+        for entry in entries {
+
+            let values = try? entry.resourceValues(forKeys: Set(keys))
+            let modified = values?.contentModificationDate ?? Date()
+
+            if values?.isDirectory == true {
+
+                let folder = VaultNode(
+                    id: UUID(),
+                    parentID: parent,
+                    name: entry.lastPathComponent,
+                    isFolder: true,
+                    size: 0,
+                    created: modified,
+                    modified: modified
+                )
+
+                model.nodes[folder.id] = folder
+
+                try migrateDirectory(
+                    entry,
+                    parent: folder.id,
+                    model: &model,
+                    key: key,
+                    done: &done,
+                    total: total,
+                    progress: progress
+                )
+
+            } else if entry.pathExtension.lowercased() == "vltx" {
+
+                let id = UUID()
+                let name = Self.originalName(of: entry)
+
+                do {
+
+                    let encrypted = try Data(contentsOf: entry, options: .mappedIfSafe)
+
+                    let plain = try VaultCrypto.decrypt(encrypted, using: key)
+
+                    let size = try VaultCrypto.encryptData(
+                        plain,
+                        to: fileURL(for: id),
+                        fileID: id,
+                        masterKey: key
+                    )
+
+                    model.nodes[id] = VaultNode(
+                        id: id,
+                        parentID: parent,
+                        name: name,
+                        isFolder: false,
+                        size: size,
+                        created: modified,
+                        modified: modified
+                    )
+
+                } catch {
+
+                    throw VaultStoreError.migrationFailed(
+                        "\(name): \(error.localizedDescription)"
+                    )
+                }
+
+                done += 1
+
+                progress?(done, total)
+            }
+        }
     }
 }

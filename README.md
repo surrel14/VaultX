@@ -8,7 +8,8 @@ VaultX is an iOS/iPadOS encrypted-file vault project designed around Apple's Fil
 
 - SwiftUI iPhone/iPad application, iOS 16+
 - Random 256-bit master key per vault, wrapped with a PBKDF2-HMAC-SHA256 password key
-- AES-GCM authenticated encryption for vault data; encrypted vault manifest
+- **Format v3**: file and folder names, structure and dates live in an encrypted index; files on disk are flat, randomly named and encrypted in 64 KiB AES-GCM chunks with per-file keys (streaming, constant memory), authenticated together with their ID. See `docs/VAULT_FORMAT_V3.md`
+- Automatic, safe migration of v0.2 vaults (asks for confirmation; the old vault is untouched if anything fails)
 - Folders inside a vault: create, browse, rename, move, delete (with confirmation and best-effort secure overwrite)
 - Multi-file import, open (Quick Look: images, PDF, video, documents) and export (share sheet / Save to Files)
 - In-RAM thumbnails for images and PDFs (never written to disk)
@@ -38,9 +39,9 @@ The v0.2 format is intentionally **not Cryptomator-compatible yet**.
 
 ### Known limitations
 
-- File and folder **names are not encrypted yet** (they are visible on disk, as is the folder structure); contents are.
-- Files are encrypted/decrypted as a whole in memory: very large files may exhaust RAM (streaming is planned for v0.4).
+- The number of files and their approximate sizes are visible on disk (names, folders and types are not).
 - "Secure delete" overwrites files before removing them, but on APFS/flash storage this cannot guarantee physical erasure; the real protection is encryption.
+- PBKDF2 is not memory-hard (Argon2id/scrypt would need a third-party library).
 - The File Provider extension is still a scaffold and is not connected to the vaults.
 
 ## Repository layout

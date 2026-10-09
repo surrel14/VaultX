@@ -198,7 +198,12 @@ final class VaultSessionTests: XCTestCase {
         try session.deleteItem(item)
 
         XCTAssertTrue(try session.items(in: session.rootDirectory).isEmpty)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: folder.path))
+        // Anche i file cifrati su disco sono spariti.
+        let remaining = try FileManager.default.contentsOfDirectory(
+            atPath: session.contentDirectory.path
+        )
+
+        XCTAssertTrue(remaining.isEmpty)
     }
 
     // MARK: - Bulk operations

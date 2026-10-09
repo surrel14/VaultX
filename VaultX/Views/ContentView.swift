@@ -67,7 +67,7 @@ struct ContentView: View {
                         VaultBrowserView(
                             session: session,
                             directory: folder.url,
-                            title: folder.url.lastPathComponent,
+                            title: session.displayName(for: folder.url),
                             reloadToken: reloadToken,
                             onLock: { lockVault() }
                         )
@@ -414,7 +414,7 @@ struct ContentView: View {
     private var incomingDestinationName: String {
 
         if let last = path.last {
-            return last.url.lastPathComponent
+            return activeSession?.displayName(for: last.url) ?? ""
         }
 
         return activeSession?.manifest.name ?? ""

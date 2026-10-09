@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 final class VaultStore {
 
@@ -75,7 +76,7 @@ final class VaultStore {
         )
 
         try fileManager.createDirectory(
-            at: dataURL(for: vault),
+            at: contentURL(for: vault),
             withIntermediateDirectories: true
         )
 
@@ -100,7 +101,7 @@ final class VaultStore {
         )
 
         let manifest = VaultManifest(
-            version: 2,
+            version: 3,
             name: safeName,
             createdAt: Date()
         )
@@ -114,6 +115,19 @@ final class VaultStore {
 
         try encryptedManifest.write(
             to: vault.appendingPathComponent("vault.manifest"),
+            options: [.atomic, .completeFileProtection]
+        )
+
+        // Indice cifrato iniziale (vuoto): nomi e cartelle vivranno solo qui.
+        let emptyIndex = try VaultIndex().serialized()
+
+        let encryptedIndex = try VaultCrypto.encrypt(
+            emptyIndex,
+            using: VaultCrypto.indexKey(masterKey: SymmetricKey(data: masterKey))
+        )
+
+        try encryptedIndex.write(
+            to: vault.appendingPathComponent("index.vaultx"),
             options: [.atomic, .completeFileProtection]
         )
 
@@ -189,11 +203,21 @@ final class VaultStore {
             from: manifestData
         )
 
-        return VaultSession(
+        let session = VaultSession(
             vaultURL: url,
             manifest: manifest,
             masterKey: masterKey
         )
+
+        do {
+            // Carica (e quindi verifica) l'indice; per i vault v0.2 non fa nulla.
+            try session.prepare()
+        } catch {
+            session.lock()
+            throw error
+        }
+
+        return session
     }
 
     // MARK: - Biometric unlock (Keychain)
@@ -397,6 +421,16 @@ final class VaultStore {
         try SecureDelete.remove(at: url)
     }
 
+    /// Cartella piatta con i file cifrati (formato v3).
+    func contentURL(for vault: URL) -> URL {
+
+        vault.appendingPathComponent(
+            "files",
+            isDirectory: true
+        )
+    }
+
+    /// Cartella con i nomi in chiaro del vecchio formato (v0.2).
     func dataURL(for vault: URL) -> URL {
 
         vault.appendingPathComponent(
@@ -430,6 +464,8 @@ enum VaultStoreError: LocalizedError {
     case biometricUnavailable
     case invalidRecoveryKey
     case noRecoveryKey
+    case migrationRequired
+    case migrationFailed(String)
 
     var errorDescription: String? {
 
@@ -464,6 +500,12 @@ enum VaultStoreError: LocalizedError {
 
         case .noRecoveryKey:
             return "Questo vault non ha una chiave di recupero."
+
+        case .migrationRequired:
+            return "Questo vault usa il formato precedente e deve essere aggiornato prima di poterlo usare."
+
+        case .migrationFailed(let detail):
+            return "Aggiornamento del vault non riuscito (il vault è rimasto nel formato precedente e non è stato modificato): \(detail)"
         }
     }
 }
