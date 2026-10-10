@@ -24,6 +24,8 @@ struct SettingsView: View {
     @AppStorage(AppSettings.inactivityLockKey)
     private var inactivityLockSeconds = AppSettings.defaultInactivityLockSeconds
 
+    @State private var showingLog = false
+
     var body: some View {
 
         NavigationStack {
@@ -62,6 +64,18 @@ struct SettingsView: View {
 
                 Section {
 
+                    Button {
+                        showingLog = true
+                    } label: {
+                        Label("Registro di sicurezza", systemImage: "list.bullet.rectangle")
+                    }
+
+                } footer: {
+                    Text("Sblocchi, tentativi falliti, esportazioni e altre operazioni sensibili di tutti i vault.")
+                }
+
+                Section {
+
                     LabeledContent(
                         "Versione",
                         value: appVersion
@@ -70,6 +84,9 @@ struct SettingsView: View {
             }
             .navigationTitle("Impostazioni")
             .navigationBarTitleDisplayMode(.inline)
+            .sheet(isPresented: $showingLog) {
+                SecurityLogView(vault: nil)
+            }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Fine") {

@@ -352,6 +352,11 @@ struct UnlockVaultView: View {
                 isMigrating = false
                 legacySession = nil
 
+                SecurityLog.shared.record(
+                    .vaultMigrated,
+                    vault: session.vaultURL.lastPathComponent
+                )
+
                 complete(with: session)
 
             } catch {

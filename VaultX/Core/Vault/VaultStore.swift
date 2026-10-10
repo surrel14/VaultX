@@ -46,7 +46,8 @@ final class VaultStore {
 
     func createVault(
         named name: String,
-        password: String
+        password: String,
+        profile: VaultProfile = .default
     ) throws -> URL {
 
         try prepare()
@@ -131,6 +132,10 @@ final class VaultStore {
             options: [.atomic, .completeFileProtection]
         )
 
+        try? saveProfile(profile, for: vault)
+
+        SecurityLog.shared.record(.vaultCreated, vault: vault.lastPathComponent)
+
         return vault
     }
 
@@ -145,16 +150,31 @@ final class VaultStore {
             contentsOf: url.appendingPathComponent("masterkey.vaultx")
         )
 
-        var masterKey = try VaultCrypto.unwrapMasterKey(
-            wrapped,
-            password: password
-        )
+        var masterKey: Data
+
+        do {
+
+            masterKey = try VaultCrypto.unwrapMasterKey(
+                wrapped,
+                password: password
+            )
+
+        } catch VaultCryptoError.authenticationFailed {
+
+            SecurityLog.shared.record(.unlockFailed, vault: url.lastPathComponent)
+
+            throw VaultCryptoError.authenticationFailed
+        }
 
         defer {
             VaultSession.wipe(&masterKey)
         }
 
-        return try openSession(at: url, masterKey: masterKey)
+        let session = try openSession(at: url, masterKey: masterKey)
+
+        recordUnlock(of: url, method: "password")
+
+        return session
     }
 
     /// Sblocca con la master key custodita nel Keychain (protetta da biometria).
@@ -176,7 +196,13 @@ final class VaultStore {
         }
 
         do {
-            return try openSession(at: url, masterKey: masterKey)
+
+            let session = try openSession(at: url, masterKey: masterKey)
+
+            recordUnlock(of: url, method: "biometria")
+
+            return session
+
         } catch {
             // Chiave non più valida (es. vault ricreato): la rimuoviamo.
             KeychainStore.delete(account: account)
@@ -243,10 +269,17 @@ final class VaultStore {
             account: keychainAccount(for: session.vaultURL),
             accessControl: try KeychainStore.makeBiometricAccessControl()
         )
+
+        SecurityLog.shared.record(.biometricEnabled, vault: session.vaultURL.lastPathComponent)
     }
 
-    func disableBiometricUnlock(for vaultURL: URL) {
+    func disableBiometricUnlock(for vaultURL: URL, logEvent: Bool = true) {
+
         KeychainStore.delete(account: keychainAccount(for: vaultURL))
+
+        if logEvent {
+            SecurityLog.shared.record(.biometricDisabled, vault: vaultURL.lastPathComponent)
+        }
     }
 
     // MARK: - Change password
@@ -287,6 +320,8 @@ final class VaultStore {
             to: wrappedURL,
             options: [.atomic, .completeFileProtection]
         )
+
+        SecurityLog.shared.record(.passwordChanged, vault: url.lastPathComponent)
     }
 
     // MARK: - Recovery key
@@ -320,6 +355,8 @@ final class VaultStore {
             options: [.atomic, .completeFileProtection]
         )
 
+        SecurityLog.shared.record(.recoveryKeyCreated, vault: session.vaultURL.lastPathComponent)
+
         return RecoveryKey.format(secret)
     }
 
@@ -328,7 +365,10 @@ final class VaultStore {
         let target = recoveryKeyURL(for: url)
 
         if fileManager.fileExists(atPath: target.path) {
+
             try SecureDelete.remove(at: target)
+
+            SecurityLog.shared.record(.recoveryKeyRemoved, vault: url.lastPathComponent)
         }
     }
 
@@ -387,6 +427,193 @@ final class VaultStore {
             to: wrappedKeyURL(for: url),
             options: [.atomic, .completeFileProtection]
         )
+
+        SecurityLog.shared.record(
+            .passwordReset,
+            vault: url.lastPathComponent,
+            detail: "Password reimpostata con la chiave di recupero"
+        )
+    }
+
+    // MARK: - Activity
+
+    private func lastAccessKey(_ vaultURL: URL) -> String {
+        "vaultx.lastAccess." + vaultURL.lastPathComponent
+    }
+
+    /// Ultimo sblocco riuscito su questo dispositivo (non viaggia con il vault).
+    func lastAccess(of vaultURL: URL) -> Date? {
+        UserDefaults.standard.object(forKey: lastAccessKey(vaultURL)) as? Date
+    }
+
+    private func recordUnlock(of url: URL, method: String) {
+
+        UserDefaults.standard.set(Date(), forKey: lastAccessKey(url))
+
+        SecurityLog.shared.record(
+            .unlockSucceeded,
+            vault: url.lastPathComponent,
+            detail: "Sblocco con " + method
+        )
+    }
+
+    // MARK: - Profile
+
+    private func profileURL(for vault: URL) -> URL {
+        vault.appendingPathComponent("profile.json")
+    }
+
+    /// Profilo salvato (o quello predefinito se manca o è illeggibile).
+    func profile(for vault: URL) -> VaultProfile {
+
+        guard let data = try? Data(contentsOf: profileURL(for: vault)),
+              let profile = try? JSONDecoder().decode(VaultProfile.self, from: data)
+        else {
+            return .default
+        }
+
+        return profile
+    }
+
+    func saveProfile(_ profile: VaultProfile, for vault: URL) throws {
+
+        var cleaned = profile
+
+        cleaned.summary = String(
+            profile.summary
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .prefix(200)
+        )
+
+        if !VaultProfile.icons.contains(cleaned.icon) {
+            cleaned.icon = VaultProfile.default.icon
+        }
+
+        if !VaultProfile.colorKeys.contains(cleaned.color) {
+            cleaned.color = VaultProfile.default.color
+        }
+
+        try JSONEncoder().encode(cleaned).write(
+            to: profileURL(for: vault),
+            options: [.atomic, .completeFileProtection]
+        )
+    }
+
+    /// Spazio occupato dal vault su disco (tutto cifrato). Può richiedere tempo
+    /// per vault grandi: chiamare fuori dal main thread.
+    func diskUsage(of vault: URL) -> Int64 {
+
+        let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey]
+
+        guard let enumerator = fileManager.enumerator(
+            at: vault,
+            includingPropertiesForKeys: keys
+        ) else {
+            return 0
+        }
+
+        var total: Int64 = 0
+
+        for case let url as URL in enumerator {
+
+            let values = try? url.resourceValues(forKeys: Set(keys))
+
+            if values?.isRegularFile == true {
+                total += Int64(values?.fileSize ?? 0)
+            }
+        }
+
+        return total
+    }
+
+    /// Profilo, ultimo accesso e tentativi falliti (veloce: senza la dimensione).
+    func quickInfo(for vault: URL) -> VaultListInfo {
+
+        VaultListInfo(
+            profile: profile(for: vault),
+            sizeBytes: nil,
+            lastAccess: lastAccess(of: vault),
+            failedAttempts: SecurityLog.shared.failedAttempts(vault: vault.lastPathComponent)
+        )
+    }
+
+    // MARK: - Export / import / duplicate
+
+    /// Esporta il vault (anche bloccato) in un pacchetto `.vaultxpkg`.
+    func exportVault(
+        at url: URL,
+        to destination: URL,
+        progress: ((Int64, Int64) -> Void)? = nil
+    ) throws {
+
+        try VaultPackage.export(
+            vaultURL: url,
+            to: destination,
+            progress: progress
+        )
+
+        SecurityLog.shared.record(
+            .vaultExported,
+            vault: url.lastPathComponent,
+            detail: "Pacchetto .vaultxpkg"
+        )
+    }
+
+    /// Importa un pacchetto creando un nuovo vault (mai sovrascrive uno esistente).
+    @discardableResult
+    func importVaultPackage(
+        from source: URL,
+        progress: ((Int64, Int64) -> Void)? = nil
+    ) throws -> URL {
+
+        try prepare()
+
+        let url = try VaultPackage.importPackage(
+            from: source,
+            into: rootURL,
+            progress: progress
+        )
+
+        // Un eventuale elemento Keychain omonimo conterrebbe una chiave sbagliata.
+        KeychainStore.delete(account: keychainAccount(for: url))
+
+        SecurityLog.shared.record(.vaultImported, vault: url.lastPathComponent)
+
+        return url
+    }
+
+    /// Duplica un vault (copia identica, stessa password) con il nome "<nome> (copia)".
+    @discardableResult
+    func duplicateVault(at url: URL) throws -> URL {
+
+        try prepare()
+
+        let base = url.lastPathComponent + " (copia)"
+
+        var destination = rootURL.appendingPathComponent(base, isDirectory: true)
+        var counter = 2
+
+        while fileManager.fileExists(atPath: destination.path) {
+
+            destination = rootURL.appendingPathComponent(
+                "\(url.lastPathComponent) (copia \(counter))",
+                isDirectory: true
+            )
+
+            counter += 1
+        }
+
+        try fileManager.copyItem(at: url, to: destination)
+
+        KeychainStore.delete(account: keychainAccount(for: destination))
+
+        SecurityLog.shared.record(
+            .vaultDuplicated,
+            vault: url.lastPathComponent,
+            detail: "Creata la copia «\(destination.lastPathComponent)»"
+        )
+
+        return destination
     }
 
     // MARK: - List / Delete
@@ -416,9 +643,11 @@ final class VaultStore {
     /// Elimina il vault (sovrascrittura best effort + rimozione) e la sua chiave Keychain.
     func deleteVault(at url: URL) throws {
 
-        disableBiometricUnlock(for: url)
+        disableBiometricUnlock(for: url, logEvent: false)
 
         try SecureDelete.remove(at: url)
+
+        SecurityLog.shared.record(.vaultDeleted, vault: url.lastPathComponent)
     }
 
     /// Cartella piatta con i file cifrati (formato v3).

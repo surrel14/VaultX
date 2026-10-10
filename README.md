@@ -19,6 +19,10 @@ VaultX is an iOS/iPadOS encrypted-file vault project designed around Apple's Fil
 - Change password and optional recovery key (256-bit, base32); new wraps use PBKDF2-HMAC-SHA256 with 600k iterations, NFC-normalised passwords, authenticated headers (legacy v0.2 vaults are still readable and get upgraded on password change)
 - Multi-select (move / export / delete), import from Photos, camera and "Open in VaultX" from other apps
 - Password strength meter, screen-recording cover
+- Vault profiles: personal / work / documents presets, icon, colour and description; size on disk and last access in the list
+- Export and import whole vaults (`.vaultxpkg`, with integrity checks) and one-tap duplicate; see `docs/VAULT_PACKAGES.md`
+- Secure sharing of a single file: password-protected `.vaultxshare` package with optional expiry (AirDrop, Files, other apps)
+- Security log: unlocks, failed attempts, exports/imports and other sensitive operations, with warnings (no passwords, keys or content)
 - Master key kept in a zeroable buffer and wiped on lock; plaintext temp copies are overwritten and deleted
 - Privacy cover in the app switcher while a vault is open
 - Unit tests for key wrapping, recovery key, encryption, tamper detection and vault operations
@@ -42,6 +46,9 @@ The v0.2 format is intentionally **not Cryptomator-compatible yet**.
 - The number of files and their approximate sizes are visible on disk (names, folders and types are not).
 - "Secure delete" overwrites files before removing them, but on APFS/flash storage this cannot guarantee physical erasure; the real protection is encryption.
 - PBKDF2 is not memory-hard (Argon2id/scrypt would need a third-party library).
+- A vault's icon, colour and description are stored unencrypted (`profile.json`) so they can be shown while the vault is locked.
+- Package expiry is enforced by VaultX when the package is opened; it cannot delete copies already received.
+- Not implemented yet: cloud sync (iPhone/iPad), file versions and history, trash, tags/favourites, integrity check, File Provider.
 - The File Provider extension is still a scaffold and is not connected to the vaults.
 
 ## Repository layout

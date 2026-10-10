@@ -117,6 +117,8 @@ struct VaultBrowserView: View {
 
     @State private var showingChangePassword = false
     @State private var showingRecovery = false
+    @State private var showingLog = false
+    @State private var secureShareItem: VaultItem?
 
     @State private var nameEditor: NameEditor?
     @State private var nameDraft = ""
@@ -156,6 +158,9 @@ struct VaultBrowserView: View {
             }
             .background {
                 presentations
+            }
+            .background {
+                alertPresentations
             }
             .onAppear {
                 loadItems()
@@ -330,6 +335,12 @@ struct VaultBrowserView: View {
                 exportItems([item])
             } label: {
                 Label("Esporta…", systemImage: "square.and.arrow.up")
+            }
+
+            Button {
+                secureShareItem = item
+            } label: {
+                Label("Condividi in modo sicuro…", systemImage: "shippingbox")
             }
         }
 
@@ -552,6 +563,12 @@ struct VaultBrowserView: View {
                     Label("Chiave di recupero…", systemImage: "lifepreserver")
                 }
 
+                Button {
+                    showingLog = true
+                } label: {
+                    Label("Registro di sicurezza…", systemImage: "list.bullet.rectangle")
+                }
+
                 if BiometricAuth.shared.isAvailable {
 
                     Toggle(isOn: biometricBinding) {
@@ -637,6 +654,30 @@ struct VaultBrowserView: View {
                 .sheet(isPresented: $showingRecovery) {
                     RecoveryKeyView(session: session)
                 }
+
+            Color.clear
+                .sheet(item: $secureShareItem) { item in
+
+                    SecureShareView(session: session, item: item) { package in
+
+                        // Aspetta che lo sheet sia sparito prima di mostrare la condivisione.
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                            shareItem = VaultShareItem(urls: [package])
+                        }
+                    }
+                }
+
+            Color.clear
+                .sheet(isPresented: $showingLog) {
+                    SecurityLogView(vault: session.vaultURL.lastPathComponent)
+                }
+        }
+        .allowsHitTesting(false)
+    }
+
+    private var alertPresentations: some View {
+
+        ZStack {
 
             Color.clear
                 .alert(
@@ -1021,6 +1062,12 @@ struct VaultBrowserView: View {
 
                 shareItem = VaultShareItem(urls: plain)
 
+                SecurityLog.shared.record(
+                    .filesExported,
+                    vault: session.vaultURL.lastPathComponent,
+                    detail: "\(sources.count) file"
+                )
+
             } catch {
 
                 busyMessage = nil
@@ -1166,6 +1213,13 @@ struct VaultBrowserView: View {
             }.value
 
             busyMessage = nil
+
+            SecurityLog.shared.record(
+                .filesDeleted,
+                vault: session.vaultURL.lastPathComponent,
+                detail: "\(candidates.count) elementi",
+                severity: candidates.count >= 10 ? .warning : .notice
+            )
 
             endSelection()
 

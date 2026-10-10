@@ -1,9 +1,9 @@
 import SwiftUI
 import UIKit
 
-// MARK: - Navigation helpers
+// MARK: - Helpers
 
-/// Wrapper Identifiable per presentare lo sheet di sblocco con `.sheet(item:)`.
+/// Wrapper Identifiable per presentare uno sheet con `.sheet(item:)`.
 struct VaultSelection: Identifiable {
     let url: URL
     var id: URL { url }
@@ -12,6 +12,43 @@ struct VaultSelection: Identifiable {
 /// Valore di navigazione per le sottocartelle di un vault aperto.
 struct VaultFolder: Hashable {
     let url: URL
+}
+
+struct IdentifiedURL: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
+struct LogTarget: Identifiable {
+    let id = UUID()
+    let vault: String?
+}
+
+/// Avanzamento di un'operazione lunga (aggiornato da un thread in background).
+final class OperationProgress: ObservableObject, @unchecked Sendable {
+
+    @Published private(set) var done: Int64 = 0
+    @Published private(set) var total: Int64 = 0
+
+    var fraction: Double? {
+        total > 0 ? min(1, Double(done) / Double(total)) : nil
+    }
+
+    func update(done: Int64, total: Int64) {
+
+        DispatchQueue.main.async {
+            self.done = done
+            self.total = total
+        }
+    }
+
+    func reset() {
+
+        DispatchQueue.main.async {
+            self.done = 0
+            self.total = 0
+        }
+    }
 }
 
 // MARK: - ContentView
@@ -27,33 +64,49 @@ struct ContentView: View {
     @AppStorage(AppSettings.inactivityLockKey)
     private var inactivityLockSeconds = AppSettings.defaultInactivityLockSeconds
 
+    // Vault
     @State private var vaults: [URL] = []
+    @State private var vaultInfo: [URL: VaultListInfo] = [:]
     @State private var biometricVaults: Set<URL> = []
 
     @State private var activeSession: VaultSession?
     @State private var path: [VaultFolder] = []
 
+    // Sheet
     @State private var unlockTarget: VaultSelection?
+    @State private var propertiesTarget: VaultSelection?
+    @State private var logTarget: LogTarget?
     @State private var showingCreateVault = false
     @State private var showingSettings = false
+    @State private var showingVaultImporter = false
+    @State private var showingPackageOpener = false
+    @State private var sharePackageToOpen: IdentifiedURL?
+    @State private var exportShareItem: VaultShareItem?
 
+    // Conferme e messaggi
     @State private var vaultPendingDeletion: URL?
     @State private var showingVaultDeleteConfirm = false
+    @State private var errorMessage: String?
+    @State private var showingError = false
+    @State private var infoMessage: String?
+    @State private var showingInfo = false
 
+    // Operazioni lunghe
+    @State private var vaultBusy: String?
+    @StateObject private var operationProgress = OperationProgress()
+
+    // Blocco automatico
     @State private var backgroundedAt: Date?
+    @State private var isScreenCaptured = false
 
-    /// Incrementato quando il contenuto del vault cambia da fuori (import da "Apri con…").
+    // File in arrivo da altre app ("Apri con VaultX")
     @State private var reloadToken = UUID()
-
-    /// File ricevuti da altre app ("Apri con VaultX") in attesa di essere importati.
     @State private var pendingIncoming: [URL] = []
     @State private var showingIncomingConfirm = false
     @State private var isImportingIncoming = false
-
-    @State private var isScreenCaptured = false
-
-    @State private var errorMessage: String?
-    @State private var showingError = false
+    @State private var incomingVaultPackage: IdentifiedURL?
+    @State private var incomingVaultName = ""
+    @State private var showingIncomingVault = false
 
     var body: some View {
 
@@ -78,10 +131,13 @@ struct ContentView: View {
             privacyCover
         }
         .overlay {
-            incomingImportOverlay
+            busyOverlay
         }
         .background {
-            presentations
+            sheetPresentations
+        }
+        .background {
+            alertPresentations
         }
         .onAppear {
             loadVaults()
@@ -99,6 +155,11 @@ struct ContentView: View {
         }
         .onChange(of: scenePhase) { phase in
             handleScenePhase(phase)
+        }
+        .onChange(of: exportShareItem?.id) { newValue in
+            if newValue == nil {
+                scheduleExportCleanup()
+            }
         }
         .onChange(of: activeSession?.vaultURL) { url in
 
@@ -134,7 +195,7 @@ struct ContentView: View {
             VaultBrowserView(
                 session: session,
                 directory: session.rootDirectory,
-                title: session.manifest.name,
+                title: session.displayName(for: session.rootDirectory),
                 reloadToken: reloadToken,
                 onLock: { lockVault() }
             )
@@ -173,12 +234,32 @@ struct ContentView: View {
 
             ToolbarItem(placement: .navigationBarTrailing) {
 
-                Button {
-                    showingCreateVault = true
+                Menu {
+
+                    Button {
+                        showingCreateVault = true
+                    } label: {
+                        Label("Nuovo vault", systemImage: "plus")
+                    }
+
+                    Button {
+                        showingVaultImporter = true
+                    } label: {
+                        Label("Importa vault…", systemImage: "square.and.arrow.down")
+                    }
+
+                    Divider()
+
+                    Button {
+                        showingPackageOpener = true
+                    } label: {
+                        Label("Apri pacchetto protetto…", systemImage: "shippingbox")
+                    }
+
                 } label: {
                     Image(systemName: "plus")
                 }
-                .accessibilityLabel("Nuovo vault")
+                .accessibilityLabel("Aggiungi")
             }
         }
     }
@@ -194,18 +275,28 @@ struct ContentView: View {
             Text("Nessun vault")
                 .font(.title2.weight(.semibold))
 
-            Text("Crea un vault protetto da password per cifrare i tuoi file.")
+            Text("Crea un vault protetto da password per cifrare i tuoi file, oppure importane uno esportato da un altro dispositivo.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 32)
 
-            Button {
-                showingCreateVault = true
-            } label: {
-                Label("Crea vault", systemImage: "plus")
+            VStack(spacing: 10) {
+
+                Button {
+                    showingCreateVault = true
+                } label: {
+                    Label("Crea vault", systemImage: "plus")
+                }
+                .buttonStyle(.borderedProminent)
+
+                Button {
+                    showingVaultImporter = true
+                } label: {
+                    Label("Importa vault", systemImage: "square.and.arrow.down")
+                }
+                .buttonStyle(.bordered)
             }
-            .buttonStyle(.borderedProminent)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -221,11 +312,38 @@ struct ContentView: View {
                 } label: {
                     VaultRow(
                         url: vault,
+                        info: vaultInfo[vault] ?? VaultListInfo(),
                         hasBiometrics: biometricVaults.contains(vault)
                     )
                 }
                 .buttonStyle(.plain)
-                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                .contextMenu {
+
+                    Button {
+                        propertiesTarget = VaultSelection(url: vault)
+                    } label: {
+                        Label("Proprietà…", systemImage: "info.circle")
+                    }
+
+                    Button {
+                        exportVault(vault)
+                    } label: {
+                        Label("Esporta…", systemImage: "square.and.arrow.up")
+                    }
+
+                    Button {
+                        duplicateVault(vault)
+                    } label: {
+                        Label("Duplica", systemImage: "doc.on.doc")
+                    }
+
+                    Button {
+                        logTarget = LogTarget(vault: vault.lastPathComponent)
+                    } label: {
+                        Label("Registro di sicurezza", systemImage: "list.bullet.rectangle")
+                    }
+
+                    Divider()
 
                     Button(role: .destructive) {
                         vaultPendingDeletion = vault
@@ -234,14 +352,42 @@ struct ContentView: View {
                         Label("Elimina", systemImage: "trash")
                     }
                 }
+                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+
+                    Button(role: .destructive) {
+                        vaultPendingDeletion = vault
+                        showingVaultDeleteConfirm = true
+                    } label: {
+                        Label("Elimina", systemImage: "trash")
+                    }
+
+                    Button {
+                        exportVault(vault)
+                    } label: {
+                        Label("Esporta", systemImage: "square.and.arrow.up")
+                    }
+                    .tint(.blue)
+                }
+                .swipeActions(edge: .leading, allowsFullSwipe: false) {
+
+                    Button {
+                        propertiesTarget = VaultSelection(url: vault)
+                    } label: {
+                        Label("Proprietà", systemImage: "info.circle")
+                    }
+                    .tint(.indigo)
+                }
             }
         }
         .listStyle(.insetGrouped)
+        .refreshable {
+            loadVaults()
+        }
     }
 
     // MARK: - Presentations
 
-    private var presentations: some View {
+    private var sheetPresentations: some View {
 
         ZStack {
 
@@ -269,6 +415,84 @@ struct ContentView: View {
                         }
                     }
                 }
+
+            Color.clear
+                .sheet(item: $propertiesTarget) { target in
+
+                    VaultPropertiesView(vaultURL: target.url) {
+                        loadVaults()
+                    }
+                }
+
+            Color.clear
+                .sheet(item: $logTarget) { target in
+                    SecurityLogView(vault: target.vault)
+                }
+
+            Color.clear
+                .sheet(isPresented: $showingVaultImporter) {
+
+                    VaultDocumentPicker(
+                        onPick: { urls in
+
+                            showingVaultImporter = false
+
+                            if let url = urls.first {
+                                importVault(from: url)
+                            }
+                        },
+                        onCancel: {
+                            showingVaultImporter = false
+                        },
+                        asCopy: false,
+                        allowsMultipleSelection: false
+                    )
+                    .ignoresSafeArea()
+                }
+
+            Color.clear
+                .sheet(isPresented: $showingPackageOpener) {
+
+                    VaultDocumentPicker(
+                        onPick: { urls in
+
+                            showingPackageOpener = false
+
+                            if let url = urls.first {
+
+                                // Aspetta che il selettore sia sparito prima di aprire il pacchetto.
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                                    sharePackageToOpen = IdentifiedURL(url: url)
+                                }
+                            }
+                        },
+                        onCancel: {
+                            showingPackageOpener = false
+                        },
+                        asCopy: false,
+                        allowsMultipleSelection: false
+                    )
+                    .ignoresSafeArea()
+                }
+
+            Color.clear
+                .sheet(item: $sharePackageToOpen) { package in
+                    OpenSharePackageView(url: package.url)
+                }
+
+            Color.clear
+                .sheet(item: $exportShareItem) { item in
+
+                    ActivityView(urls: item.urls)
+                        .presentationDetents([.medium, .large])
+                }
+        }
+        .allowsHitTesting(false)
+    }
+
+    private var alertPresentations: some View {
+
+        ZStack {
 
             Color.clear
                 .alert(
@@ -308,6 +532,38 @@ struct ContentView: View {
 
             Color.clear
                 .alert(
+                    "Importare il vault «\(incomingVaultName)»?",
+                    isPresented: $showingIncomingVault
+                ) {
+
+                    Button("Importa") {
+
+                        if let package = incomingVaultPackage {
+                            importVault(from: package.url)
+                        }
+                    }
+
+                    Button("Annulla", role: .cancel) {
+                        discardIncomingVaultPackage()
+                    }
+
+                } message: {
+
+                    Text("Verrà creato un nuovo vault: non sostituisce quelli esistenti. Si apre con la password del vault originale.")
+                }
+
+            Color.clear
+                .alert(
+                    "Fatto",
+                    isPresented: $showingInfo
+                ) {
+                    Button("OK", role: .cancel) {}
+                } message: {
+                    Text(infoMessage ?? "")
+                }
+
+            Color.clear
+                .alert(
                     "Errore",
                     isPresented: $showingError
                 ) {
@@ -320,7 +576,7 @@ struct ContentView: View {
     }
 
     /// Copre l'interfaccia quando l'app non è attiva (app switcher,
-    /// centro di controllo...) per non mostrare i file negli snapshot di iOS.
+    /// centro di controllo...) o durante una registrazione dello schermo.
     @ViewBuilder
     private var privacyCover: some View {
 
@@ -348,6 +604,45 @@ struct ContentView: View {
         }
     }
 
+    @ViewBuilder
+    private var busyOverlay: some View {
+
+        if let message = vaultBusy ?? (isImportingIncoming ? "Cifratura in corso…" : nil) {
+
+            ZStack {
+
+                Color.black
+                    .opacity(0.25)
+                    .ignoresSafeArea()
+
+                VStack(spacing: 12) {
+
+                    if let fraction = operationProgress.fraction, vaultBusy != nil {
+
+                        ProgressView(value: fraction)
+                            .frame(width: 200)
+
+                        Text(message)
+                            .font(.subheadline)
+
+                        Text("\(Int(fraction * 100))%")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+
+                    } else {
+
+                        ProgressView(message)
+                    }
+                }
+                .padding(20)
+                .background(
+                    .regularMaterial,
+                    in: RoundedRectangle(cornerRadius: 14)
+                )
+            }
+        }
+    }
+
     // MARK: - Vaults
 
     private func loadVaults() {
@@ -358,16 +653,55 @@ struct ContentView: View {
 
             vaults = list
 
+            var infos: [URL: VaultListInfo] = [:]
+
+            for url in list {
+
+                var info = VaultStore.shared.quickInfo(for: url)
+
+                // Si tiene la dimensione già calcolata finché non arriva quella nuova.
+                info.sizeBytes = vaultInfo[url]?.sizeBytes
+
+                infos[url] = info
+            }
+
+            vaultInfo = infos
+
             biometricVaults = Set(
                 list.filter {
                     VaultStore.shared.isBiometricUnlockEnabled(for: $0)
                 }
             )
 
+            loadSizes(for: list)
+
         } catch {
 
             errorMessage = error.localizedDescription
             showingError = true
+        }
+    }
+
+    /// La dimensione richiede di scorrere tutti i file: si calcola in background.
+    private func loadSizes(for list: [URL]) {
+
+        Task { @MainActor in
+
+            let sizes = await Task.detached(priority: .utility) { () -> [URL: Int64] in
+
+                var result: [URL: Int64] = [:]
+
+                for url in list {
+                    result[url] = VaultStore.shared.diskUsage(of: url)
+                }
+
+                return result
+
+            }.value
+
+            for (url, size) in sizes {
+                vaultInfo[url]?.sizeBytes = size
+            }
         }
     }
 
@@ -397,6 +731,156 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - Export / import / duplicate
+
+    private func exportVault(_ url: URL) {
+
+        guard vaultBusy == nil else {
+            return
+        }
+
+        vaultBusy = "Esportazione in corso…"
+        operationProgress.reset()
+
+        let tracker = operationProgress
+
+        Task { @MainActor in
+
+            do {
+
+                let package = try await Task.detached(
+                    priority: .userInitiated
+                ) { () -> URL in
+
+                    let folder = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("VaultXExport", isDirectory: true)
+                        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+
+                    try FileManager.default.createDirectory(
+                        at: folder,
+                        withIntermediateDirectories: true
+                    )
+
+                    let destination = folder.appendingPathComponent(
+                        "\(url.lastPathComponent).\(VaultPackage.fileExtension)"
+                    )
+
+                    try VaultStore.shared.exportVault(at: url, to: destination) { done, total in
+                        tracker.update(done: done, total: total)
+                    }
+
+                    return destination
+
+                }.value
+
+                vaultBusy = nil
+
+                exportShareItem = VaultShareItem(urls: [package])
+
+            } catch {
+
+                vaultBusy = nil
+
+                errorMessage = error.localizedDescription
+                showingError = true
+            }
+        }
+    }
+
+    /// I pacchetti esportati sono cifrati, ma non hanno motivo di restare in tmp.
+    private func scheduleExportCleanup() {
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 60) {
+
+            if exportShareItem == nil, vaultBusy == nil {
+                VaultSession.removeTemporaryFiles()
+            }
+        }
+    }
+
+    private func importVault(from url: URL) {
+
+        guard vaultBusy == nil else {
+            return
+        }
+
+        vaultBusy = "Importazione in corso…"
+        operationProgress.reset()
+
+        let tracker = operationProgress
+
+        Task { @MainActor in
+
+            do {
+
+                let imported = try await Task.detached(
+                    priority: .userInitiated
+                ) {
+                    try VaultStore.shared.importVaultPackage(from: url) { done, total in
+                        tracker.update(done: done, total: total)
+                    }
+                }.value
+
+                vaultBusy = nil
+
+                loadVaults()
+
+                infoMessage = "Vault «\(imported.lastPathComponent)» importato. Si apre con la password del vault originale."
+                showingInfo = true
+
+            } catch {
+
+                vaultBusy = nil
+
+                errorMessage = error.localizedDescription
+                showingError = true
+            }
+
+            // Se il pacchetto era una copia ricevuta da "Apri con…" la eliminiamo.
+            if VaultSession.isDisposableCopy(url) {
+                try? FileManager.default.removeItem(at: url)
+            }
+
+            incomingVaultPackage = nil
+        }
+    }
+
+    private func duplicateVault(_ url: URL) {
+
+        guard vaultBusy == nil else {
+            return
+        }
+
+        vaultBusy = "Duplicazione in corso…"
+        operationProgress.reset()
+
+        Task { @MainActor in
+
+            do {
+
+                let copy = try await Task.detached(
+                    priority: .userInitiated
+                ) {
+                    try VaultStore.shared.duplicateVault(at: url)
+                }.value
+
+                vaultBusy = nil
+
+                loadVaults()
+
+                infoMessage = "Creata la copia «\(copy.lastPathComponent)»: si apre con la stessa password."
+                showingInfo = true
+
+            } catch {
+
+                vaultBusy = nil
+
+                errorMessage = error.localizedDescription
+                showingError = true
+            }
+        }
+    }
+
     // MARK: - Incoming files ("Apri con VaultX")
 
     private var incomingTitle: String {
@@ -417,7 +901,7 @@ struct ContentView: View {
             return activeSession?.displayName(for: last.url) ?? ""
         }
 
-        return activeSession?.manifest.name ?? ""
+        return activeSession.map { $0.displayName(for: $0.rootDirectory) } ?? ""
     }
 
     @ViewBuilder
@@ -449,30 +933,39 @@ struct ContentView: View {
         }
     }
 
-    @ViewBuilder
-    private var incomingImportOverlay: some View {
-
-        if isImportingIncoming {
-
-            ZStack {
-
-                Color.black
-                    .opacity(0.25)
-                    .ignoresSafeArea()
-
-                ProgressView("Cifratura in corso…")
-                    .padding(20)
-                    .background(
-                        .regularMaterial,
-                        in: RoundedRectangle(cornerRadius: 14)
-                    )
-            }
-        }
-    }
-
     private func handleIncoming(_ url: URL) {
 
         guard url.isFileURL else {
+            return
+        }
+
+        let ext = url.pathExtension.lowercased()
+
+        // Vault esportato (.vaultxpkg): si importa come nuovo vault.
+        if ext == VaultPackage.fileExtension {
+
+            do {
+
+                let header = try VaultPackage.inspect(url)
+
+                incomingVaultName = header.name
+                incomingVaultPackage = IdentifiedURL(url: url)
+                showingIncomingVault = true
+
+            } catch {
+
+                errorMessage = error.localizedDescription
+                showingError = true
+            }
+
+            return
+        }
+
+        // Pacchetto protetto da password (.vaultxshare): si apre con la sua password.
+        if ext == SharePackage.fileExtension {
+
+            sharePackageToOpen = IdentifiedURL(url: url)
+
             return
         }
 
@@ -533,6 +1026,16 @@ struct ContentView: View {
                 try? SecureDelete.remove(at: url)
             }
         }
+    }
+
+    private func discardIncomingVaultPackage() {
+
+        if let package = incomingVaultPackage,
+           VaultSession.isDisposableCopy(package.url) {
+            try? FileManager.default.removeItem(at: package.url)
+        }
+
+        incomingVaultPackage = nil
     }
 
     private static func currentScreenIsCaptured() -> Bool {
@@ -612,32 +1115,47 @@ struct ContentView: View {
 private struct VaultRow: View {
 
     let url: URL
+    let info: VaultListInfo
     let hasBiometrics: Bool
 
     var body: some View {
 
         HStack(spacing: 14) {
 
-            Image(systemName: "lock.fill")
-                .font(.title3)
-                .foregroundStyle(.white)
-                .frame(width: 44, height: 44)
-                .background(
-                    Color.accentColor.gradient,
-                    in: RoundedRectangle(
-                        cornerRadius: 10,
-                        style: .continuous
-                    )
-                )
+            VaultIconBadge(profile: info.profile)
 
             VStack(alignment: .leading, spacing: 3) {
 
                 Text(url.lastPathComponent)
                     .font(.headline)
 
-                Text("Vault cifrato")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text(
+                    info.profile.summary.isEmpty
+                        ? "Vault cifrato"
+                        : info.profile.summary
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+
+                if info.failedAttempts > 0 {
+
+                    Label(
+                        info.failedAttempts == 1
+                            ? "1 tentativo di sblocco fallito"
+                            : "\(info.failedAttempts) tentativi di sblocco falliti",
+                        systemImage: "exclamationmark.triangle.fill"
+                    )
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+
+                } else {
+
+                    Text(statsLine)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
             }
 
             Spacer()
@@ -654,5 +1172,33 @@ private struct VaultRow: View {
         }
         .padding(.vertical, 4)
         .contentShape(Rectangle())
+    }
+
+    private var statsLine: String {
+
+        var parts: [String] = []
+
+        if let size = info.sizeBytes {
+
+            parts.append(
+                ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
+            )
+        }
+
+        if let lastAccess = info.lastAccess {
+
+            let formatter = RelativeDateTimeFormatter()
+            formatter.unitsStyle = .short
+
+            parts.append(
+                "Aperto " + formatter.localizedString(for: lastAccess, relativeTo: Date())
+            )
+
+        } else {
+
+            parts.append("Mai aperto")
+        }
+
+        return parts.joined(separator: " · ")
     }
 }

@@ -15,6 +15,12 @@ struct VaultDocumentPicker:
     let onCancel:
         () -> Void
 
+    /// `true`: il selettore consegna una copia temporanea (comodo per file piccoli).
+    /// `false`: consegna l'URL originale (security-scoped), senza duplicare file enormi.
+    var asCopy: Bool = true
+
+    var allowsMultipleSelection: Bool = true
+
 
     func makeCoordinator()
         -> Coordinator {
@@ -40,11 +46,11 @@ struct VaultDocumentPicker:
                         UTType.item
                     ],
                 asCopy:
-                    true
+                    asCopy
             )
 
         picker.allowsMultipleSelection =
-            true
+            allowsMultipleSelection
 
         picker.delegate =
             context.coordinator

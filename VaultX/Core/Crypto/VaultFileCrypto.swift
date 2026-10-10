@@ -114,8 +114,25 @@ extension VaultCrypto {
         header.append(chunkSizeLog2)
         header.append(salt)
 
-        let aad = header + idBytes(fileID)
-        let key = fileKey(masterKey: masterKey, salt: salt)
+        return try writeChunks(
+            next: next,
+            to: destination,
+            header: header,
+            key: fileKey(masterKey: masterKey, salt: salt),
+            aad: header + idBytes(fileID)
+        )
+    }
+
+    /// Nucleo condiviso (file del vault e pacchetti di condivisione): scrive `header`
+    /// e poi i chunk AES-GCM con nonce a contatore e flag di ultimo chunk.
+    /// `aad` autentica ogni chunk. Restituisce la dimensione in chiaro.
+    static func writeChunks(
+        next: () throws -> Data,
+        to destination: URL,
+        header: Data,
+        key: SymmetricKey,
+        aad: Data
+    ) throws -> Int64 {
 
         guard FileManager.default.createFile(
             atPath: destination.path,
@@ -270,8 +287,24 @@ extension VaultCrypto {
         let cipherChunkSize = (1 << Int(log2)) + VaultFileFormat.tagLength
 
         let salt = Data(header.suffix(VaultFileFormat.saltLength))
-        let key = fileKey(masterKey: masterKey, salt: salt)
-        let aad = header + idBytes(fileID)
+
+        try readChunks(
+            from: input,
+            key: fileKey(masterKey: masterKey, salt: salt),
+            aad: header + idBytes(fileID),
+            cipherChunkSize: cipherChunkSize,
+            sink: sink
+        )
+    }
+
+    /// Nucleo condiviso di lettura: decifra i chunk a partire dalla posizione corrente di `input`.
+    static func readChunks(
+        from input: FileHandle,
+        key: SymmetricKey,
+        aad: Data,
+        cipherChunkSize: Int,
+        sink: (Data) throws -> Void
+    ) throws {
 
         var counter: UInt32 = 0
 

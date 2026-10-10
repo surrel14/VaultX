@@ -10,18 +10,14 @@ struct CreateVaultView: View {
     private var dismiss
 
     @State private var vaultName = ""
-
     @State private var password = ""
-
     @State private var confirmPassword = ""
+    @State private var profile = VaultProfile.Preset.personal.profile
     @State private var isCreating = false
-
     @State private var errorMessage: String?
-
     @State private var showingError = false
 
     let onCreated: () -> Void
-
 
     var body: some View {
 
@@ -53,23 +49,17 @@ struct CreateVaultView: View {
                     PasswordStrengthView(password: password)
 
                 } header: {
-
                     Text("Nuovo vault")
-
                 } footer: {
-
-                    Text(
-                        "La password deve contenere almeno 8 caratteri."
-                    )
+                    Text("La password deve contenere almeno 8 caratteri.")
                 }
 
+                VaultProfileFields(profile: $profile)
 
                 Section {
 
                     Button {
-
                         createVault()
-
                     } label: {
 
                         HStack {
@@ -79,121 +69,69 @@ struct CreateVaultView: View {
                             if isCreating {
                                 ProgressView()
                             } else {
-                                Text(
-                                    "Crea vault"
-                                )
-                                .fontWeight(
-                                    .semibold
-                                )
+                                Text("Crea vault")
+                                    .fontWeight(.semibold)
                             }
 
                             Spacer()
                         }
                     }
-                    .disabled(
-                        !canCreate
-                    )
+                    .disabled(!canCreate)
                 }
             }
-            .navigationTitle(
-                "Crea Vault"
-            )
-            .navigationBarTitleDisplayMode(
-                .inline
-            )
+            .navigationTitle("Crea Vault")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
 
-                ToolbarItem(
-                    placement:
-                        .navigationBarLeading
-                ) {
-
-                    Button(
-                        "Annulla"
-                    ) {
-
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Annulla") {
                         dismiss()
                     }
+                    .disabled(isCreating)
                 }
             }
             .alert(
                 "Errore",
-                isPresented:
-                    $showingError
+                isPresented: $showingError
             ) {
-
-                Button(
-                    "OK",
-                    role: .cancel
-                ) {}
-
+                Button("OK", role: .cancel) {}
             } message: {
-
-                Text(
-                    errorMessage ??
-                    "Errore durante la creazione."
-                )
+                Text(errorMessage ?? "Errore durante la creazione.")
             }
         }
     }
 
-
     private var canCreate: Bool {
 
-        !vaultName
-            .trimmingCharacters(
-                in:
-                    .whitespacesAndNewlines
-            )
-            .isEmpty
-        &&
-        password.count >= 8
-        &&
-        password == confirmPassword
-        &&
-        !isCreating
+        !vaultName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && password.count >= 8
+            && password == confirmPassword
+            && !isCreating
     }
-
 
     private func createVault() {
 
-        let name =
-            vaultName.trimmingCharacters(
-                in:
-                    .whitespacesAndNewlines
-            )
+        let name = vaultName.trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard !name.isEmpty else {
-
-            showError(
-                "Inserisci un nome per il vault."
-            )
-
+            showError("Inserisci un nome per il vault.")
             return
         }
 
         guard password.count >= 8 else {
-
-            showError(
-                "La password deve contenere almeno 8 caratteri."
-            )
-
+            showError("La password deve contenere almeno 8 caratteri.")
             return
         }
 
         guard password == confirmPassword else {
-
-            showError(
-                "Le password non coincidono."
-            )
-
+            showError("Le password non coincidono.")
             return
         }
-
 
         isCreating = true
 
         let enteredPassword = password
+        let chosenProfile = profile
 
         // PBKDF2 (600k iterazioni) è pesante: fuori dal main thread.
         Task { @MainActor in
@@ -205,7 +143,8 @@ struct CreateVaultView: View {
                 ) {
                     try VaultStore.shared.createVault(
                         named: name,
-                        password: enteredPassword
+                        password: enteredPassword,
+                        profile: chosenProfile
                     )
                 }.value
 
@@ -219,20 +158,14 @@ struct CreateVaultView: View {
 
                 isCreating = false
 
-                showError(
-                    error.localizedDescription
-                )
+                showError(error.localizedDescription)
             }
         }
     }
 
-
-    private func showError(
-        _ message: String
-    ) {
+    private func showError(_ message: String) {
 
         errorMessage = message
-
         showingError = true
     }
 }

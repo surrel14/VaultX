@@ -1008,32 +1008,35 @@ final class VaultSession: @unchecked Sendable {
 
         let tmp = FileManager.default.temporaryDirectory
 
-        var targets: [URL] = []
+        func children(of name: String) -> [URL] {
 
-        for name in ["VaultXOpen", "VaultXImport"] {
+            let directory = tmp.appendingPathComponent(name, isDirectory: true)
 
-            let directory = tmp.appendingPathComponent(
-                name,
-                isDirectory: true
-            )
-
-            if let children = try? FileManager.default.contentsOfDirectory(
+            return (try? FileManager.default.contentsOfDirectory(
                 at: directory,
                 includingPropertiesForKeys: nil,
                 options: []
-            ) {
-                targets.append(contentsOf: children)
-            }
+            )) ?? []
         }
 
-        guard !targets.isEmpty else {
+        // Copie in chiaro: sovrascritte prima di essere rimosse.
+        let plaintext = children(of: "VaultXOpen") + children(of: "VaultXImport")
+
+        // Pacchetti già cifrati (esportazioni e condivisioni): basta rimuoverli.
+        let encrypted = children(of: "VaultXExport") + children(of: "VaultXShare")
+
+        guard !plaintext.isEmpty || !encrypted.isEmpty else {
             return
         }
 
         DispatchQueue.global(qos: .utility).async {
 
-            for target in targets {
+            for target in plaintext {
                 try? SecureDelete.remove(at: target)
+            }
+
+            for target in encrypted {
+                try? FileManager.default.removeItem(at: target)
             }
         }
     }

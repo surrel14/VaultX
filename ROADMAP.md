@@ -24,7 +24,17 @@
 - [x] Change password, recovery key, 600k-iteration PBKDF2 for new wraps
 - [x] Multi-select, import from Photos / camera / "Open in"
 - [x] Format v3: encrypted names, chunked streaming, per-file keys + AAD, migration from v2
-- [ ] Vaults stored in iCloud Drive / other Files locations (after format v3)
+- [x] Vault export / import (`.vaultxpkg`) and duplicate
+- [x] Vault profiles (icon, colour, description, size, last access)
+- [x] Secure sharing of single files (`.vaultxshare`, password + expiry)
+- [x] Security log
+- [ ] File versions and history, retention rules
+- [ ] Protected trash
+- [ ] Tags, favourites, advanced search
+- [ ] Integrity check
+- [ ] Progress for long operations, resumable imports
+- [ ] Cloud sync iPhone <-> iPad (merge-friendly index, conflict handling) and WebDAV
+- [ ] Vaults stored in iCloud Drive / other Files locations (depends on sync design)
 
 ## v0.3 — File Provider
 
