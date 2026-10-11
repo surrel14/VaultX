@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct UnlockVaultView: View {
 
@@ -23,6 +24,7 @@ struct UnlockVaultView: View {
     @State private var isMigrating = false
     @StateObject private var migration = MigrationProgress()
     @State private var errorMessage: String?
+    @State private var errorTitle = "Sblocco non riuscito"
     @State private var showingError = false
 
     private var biometrics: BiometricAuth {
@@ -157,7 +159,7 @@ struct UnlockVaultView: View {
 
                 Color.clear
                     .alert(
-                        "Sblocco non riuscito",
+                        errorTitle,
                         isPresented: $showingError
                     ) {
                         Button("OK", role: .cancel) {}
@@ -246,6 +248,27 @@ struct UnlockVaultView: View {
             } catch {
 
                 isUnlocking = false
+
+                if case VaultCryptoError.authenticationFailed = error {
+
+                    // Il tentativo fallito è già stato registrato dallo store.
+                    let attempts = SecurityLog.shared.failedAttempts(
+                        vault: url.lastPathComponent
+                    )
+
+                    if let alert = UnlockFailureMessage.make(
+                        attempts: attempts,
+                        hasRecoveryKey: hasRecoveryKey
+                    ) {
+
+                        UINotificationFeedbackGenerator()
+                            .notificationOccurred(.warning)
+
+                        present(alert.message, title: alert.title)
+
+                        return
+                    }
+                }
 
                 present(error.localizedDescription)
             }
@@ -416,8 +439,12 @@ struct UnlockVaultView: View {
         }
     }
 
-    private func present(_ message: String) {
+    private func present(
+        _ message: String,
+        title: String = "Sblocco non riuscito"
+    ) {
 
+        errorTitle = title
         errorMessage = message
         showingError = true
     }
@@ -439,5 +466,37 @@ final class MigrationProgress: ObservableObject, @unchecked Sendable {
             self.done = done
             self.total = total
         }
+    }
+}
+
+
+// MARK: - Failed attempts message
+
+/// Messaggio mostrato quando i tentativi di sblocco falliti consecutivi sono 3 o più.
+enum UnlockFailureMessage {
+
+    static let threshold = 3
+
+    static func make(
+        attempts: Int,
+        hasRecoveryKey: Bool
+    ) -> (title: String, message: String)? {
+
+        guard attempts >= threshold else {
+            return nil
+        }
+
+        var message = "Password errata. Gli ultimi \(attempts) tentativi di sblocco non sono riusciti e sono stati registrati nel registro di sicurezza.\n\nSe non sei stato tu, cambia la password del vault appena possibile."
+
+        if hasRecoveryKey {
+
+            message += "\n\nSe l'hai dimenticata, usa «Password dimenticata?» con la tua chiave di recupero."
+
+        } else {
+
+            message += "\n\nSe l'hai dimenticata: senza password e senza chiave di recupero il contenuto del vault non si può recuperare."
+        }
+
+        return ("Attenzione: \(attempts) tentativi falliti", message)
     }
 }

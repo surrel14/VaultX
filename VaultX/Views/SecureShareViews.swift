@@ -249,6 +249,12 @@ struct OpenSharePackageView: View {
 
     let url: URL
 
+    /// Nome della cartella di un vault aperto in cui si può salvare il file (nil = nessun vault aperto).
+    var destinationName: String?
+
+    /// Salva il file decifrato nel vault aperto (cifrandolo di nuovo con le chiavi del vault).
+    var onSaveToVault: ((URL) async throws -> Void)?
+
     @Environment(\.dismiss)
     private var dismiss
 
@@ -259,6 +265,8 @@ struct OpenSharePackageView: View {
     @State private var opened: (metadata: SharePackage.Metadata, fileURL: URL)?
     @State private var previewURL: URL?
     @State private var shareItem: VaultShareItem?
+    @State private var isSaving = false
+    @State private var savedTo: String?
     @State private var errorMessage: String?
     @State private var showingError = false
 
@@ -417,6 +425,50 @@ struct OpenSharePackageView: View {
                 Label("Condividi o salva…", systemImage: "square.and.arrow.up")
             }
         }
+
+        if let destinationName, onSaveToVault != nil {
+
+            Section {
+
+                Button {
+                    saveToVault()
+                } label: {
+
+                    if let savedTo {
+
+                        Label(
+                            "Salvato in «\(savedTo)»",
+                            systemImage: "checkmark.circle.fill"
+                        )
+
+                    } else if isSaving {
+
+                        HStack {
+                            ProgressView()
+                            Text("Salvataggio in corso…")
+                        }
+
+                    } else {
+
+                        Label(
+                            "Salva nel vault («\(destinationName)»)",
+                            systemImage: "lock.doc"
+                        )
+                    }
+                }
+                .disabled(isSaving || savedTo != nil)
+
+            } footer: {
+                Text("Il file viene cifrato con le chiavi del vault e aggiunto alla cartella aperta.")
+            }
+
+        } else {
+
+            Section {
+            } footer: {
+                Text("Per salvarlo in un vault: sblocca il vault e usa «Importa pacchetto protetto…» dal menu.")
+            }
+        }
     }
 
     // MARK: Actions
@@ -464,6 +516,38 @@ struct OpenSharePackageView: View {
                 errorMessage = error.localizedDescription
                 showingError = true
             }
+        }
+    }
+
+    private func saveToVault() {
+
+        guard let onSaveToVault,
+              let opened,
+              !isSaving,
+              savedTo == nil
+        else {
+            return
+        }
+
+        isSaving = true
+
+        let destination = destinationName
+
+        Task { @MainActor in
+
+            do {
+
+                try await onSaveToVault(opened.fileURL)
+
+                savedTo = destination ?? "vault"
+
+            } catch {
+
+                errorMessage = error.localizedDescription
+                showingError = true
+            }
+
+            isSaving = false
         }
     }
 

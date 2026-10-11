@@ -479,7 +479,22 @@ struct ContentView: View {
 
             Color.clear
                 .sheet(item: $sharePackageToOpen) { package in
-                    OpenSharePackageView(url: package.url)
+
+                    if activeSession != nil {
+
+                        // Con un vault aperto il file si può salvare direttamente al suo interno.
+                        OpenSharePackageView(
+                            url: package.url,
+                            destinationName: incomingDestinationName,
+                            onSaveToVault: { fileURL in
+                                try await saveToOpenVault(fileURL)
+                            }
+                        )
+
+                    } else {
+
+                        OpenSharePackageView(url: package.url)
+                    }
                 }
 
             Color.clear
@@ -1028,6 +1043,22 @@ struct ContentView: View {
                 try? SecureDelete.remove(at: url)
             }
         }
+    }
+
+    /// Salva nel vault aperto (cartella corrente) un file decifrato da un pacchetto protetto.
+    private func saveToOpenVault(_ fileURL: URL) async throws {
+
+        guard let session = activeSession,
+              let destination = incomingDestination
+        else {
+            throw VaultStoreError.locked
+        }
+
+        try await Task.detached(priority: .userInitiated) {
+            _ = try session.importFile(at: fileURL, into: destination)
+        }.value
+
+        reloadToken = UUID()
     }
 
     private func discardIncomingVaultPackage() {

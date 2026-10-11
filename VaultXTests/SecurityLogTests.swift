@@ -109,4 +109,25 @@ final class SecurityLogTests: XCTestCase {
         XCTAssertEqual(SecurityLog.defaultSeverity(for: .vaultExported), .notice)
         XCTAssertEqual(SecurityLog.defaultSeverity(for: .passwordReset), .warning)
     }
+
+    func testFailureMessageAppearsFromThirdAttempt() throws {
+
+        XCTAssertNil(UnlockFailureMessage.make(attempts: 0, hasRecoveryKey: false))
+        XCTAssertNil(UnlockFailureMessage.make(attempts: 2, hasRecoveryKey: true))
+
+        let withKey = try XCTUnwrap(
+            UnlockFailureMessage.make(attempts: 3, hasRecoveryKey: true)
+        )
+
+        XCTAssertTrue(withKey.title.contains("3"))
+        XCTAssertTrue(withKey.message.contains("Password dimenticata?"))
+
+        let withoutKey = try XCTUnwrap(
+            UnlockFailureMessage.make(attempts: 5, hasRecoveryKey: false)
+        )
+
+        XCTAssertTrue(withoutKey.title.contains("5"))
+        XCTAssertTrue(withoutKey.message.contains("non si può recuperare"))
+        XCTAssertFalse(withoutKey.message.contains("Password dimenticata?"))
+    }
 }

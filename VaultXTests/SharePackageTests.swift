@@ -310,4 +310,35 @@ FhVj8cC8FwnJpBwtWrWhtGghW+u0DhPHqIY44vjyUXloCEOWuiJ/ETT6DTZFto3EpxHY+UUm
         XCTAssertFalse(opened.fileURL.lastPathComponent.contains("/"))
         XCTAssertTrue(opened.fileURL.path.contains("VaultXOpen"))
     }
+
+    func testDecryptedPackageCanBeSavedIntoAVault() throws {
+
+        let store = VaultStore(rootURL: tempRoot.appendingPathComponent("Vaults"))
+
+        let vaultURL = try store.createVault(named: "Destinazione", password: password)
+        let session = try store.unlockVault(at: vaultURL, password: password)
+
+        let plain = Data("estratto conto".utf8)
+
+        let package = try makePackage(contents: plain, name: "contratto.pdf")
+
+        let opened = try SharePackage.open(package, password: password)
+
+        let folder = try session.createFolder(named: "Ricevuti", in: session.rootDirectory)
+
+        try session.importFile(at: opened.fileURL, into: folder)
+
+        // Il file è nel vault con il nome originale...
+        XCTAssertEqual(try session.items(in: folder).map(\.name), ["contratto.pdf"])
+
+        // ... e quello decifrato non è stato eliminato (serve ancora all'anteprima).
+        XCTAssertTrue(FileManager.default.fileExists(atPath: opened.fileURL.path))
+
+        let item = try XCTUnwrap(session.items(in: folder).first)
+        let back = try session.decryptToTemporaryFile(item.url)
+
+        XCTAssertEqual(try Data(contentsOf: back), plain)
+
+        session.lock()
+    }
 }

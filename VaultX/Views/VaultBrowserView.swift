@@ -119,6 +119,8 @@ struct VaultBrowserView: View {
     @State private var showingRecovery = false
     @State private var showingLog = false
     @State private var secureShareItem: VaultItem?
+    @State private var showingPackagePicker = false
+    @State private var packageToOpen: IdentifiedURL?
 
     @State private var nameEditor: NameEditor?
     @State private var nameDraft = ""
@@ -515,6 +517,12 @@ struct VaultBrowserView: View {
             }
 
             Button {
+                showingPackagePicker = true
+            } label: {
+                Label("Importa pacchetto protetto…", systemImage: "shippingbox")
+            }
+
+            Button {
                 startNewFolder()
             } label: {
                 Label("Nuova cartella", systemImage: "folder.badge.plus")
@@ -670,6 +678,43 @@ struct VaultBrowserView: View {
             Color.clear
                 .sheet(isPresented: $showingLog) {
                     SecurityLogView(vault: session.vaultURL.lastPathComponent)
+                }
+
+            Color.clear
+                .sheet(isPresented: $showingPackagePicker) {
+
+                    VaultDocumentPicker(
+                        onPick: { urls in
+
+                            showingPackagePicker = false
+
+                            if let url = urls.first {
+
+                                // Aspetta che il selettore sia sparito prima di aprire il pacchetto.
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                                    packageToOpen = IdentifiedURL(url: url)
+                                }
+                            }
+                        },
+                        onCancel: {
+                            showingPackagePicker = false
+                        },
+                        asCopy: true,
+                        allowsMultipleSelection: false
+                    )
+                    .ignoresSafeArea()
+                }
+
+            Color.clear
+                .sheet(item: $packageToOpen) { package in
+
+                    OpenSharePackageView(
+                        url: package.url,
+                        destinationName: title,
+                        onSaveToVault: { fileURL in
+                            try await importDecrypted(fileURL)
+                        }
+                    )
                 }
         }
         .allowsHitTesting(false)
@@ -996,6 +1041,23 @@ struct VaultBrowserView: View {
         }
     }
 
+    // MARK: - Import decrypted file (protected package)
+
+    /// Cifra con le chiavi del vault il file decifrato da un pacchetto protetto
+    /// e lo aggiunge a questa cartella. Non elimina il file di partenza (serve ancora
+    /// all'anteprima): la copia temporanea viene ripulita alla chiusura.
+    private func importDecrypted(_ fileURL: URL) async throws {
+
+        let currentSession = session
+        let target = directory
+
+        try await Task.detached(priority: .userInitiated) {
+            _ = try currentSession.importFile(at: fileURL, into: target)
+        }.value
+
+        loadItems()
+    }
+
     // MARK: - Open / Export
 
     private func openItem(_ item: VaultItem) {
@@ -1102,6 +1164,7 @@ struct VaultBrowserView: View {
     private var isExternalUIActive: Bool {
 
         showingImporter
+            || showingPackagePicker
             || showingPhotoPicker
             || showingCamera
             || previewURL != nil
