@@ -444,7 +444,9 @@ struct ContentView: View {
                         onCancel: {
                             showingVaultImporter = false
                         },
-                        asCopy: false,
+                        // Copia temporanea: con `asCopy: false` iOS lascia i file grigi (non selezionabili)
+                        // perché l'app dichiara LSSupportsOpeningDocumentsInPlace = NO.
+                        asCopy: true,
                         allowsMultipleSelection: false
                     )
                     .ignoresSafeArea()
@@ -469,7 +471,7 @@ struct ContentView: View {
                         onCancel: {
                             showingPackageOpener = false
                         },
-                        asCopy: false,
+                        asCopy: true,
                         allowsMultipleSelection: false
                     )
                     .ignoresSafeArea()
