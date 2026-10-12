@@ -640,6 +640,72 @@ final class VaultStore {
         }
     }
 
+    /// Rinomina un vault senza ricifrare i file. La password viene verificata e
+    /// il nome nel manifest cifrato viene aggiornato insieme al nome della cartella.
+    /// Chiamare fuori dal main thread: le operazioni Keychain possono mostrare biometria.
+    func renameVault(at url: URL, to requestedName: String, password: String) throws -> URL {
+
+        let safeName = sanitizedName(requestedName)
+        guard !safeName.isEmpty else { throw VaultStoreError.invalidName }
+
+        let destination = rootURL.appendingPathComponent(safeName, isDirectory: true)
+        if destination.standardizedFileURL == url.standardizedFileURL { return url }
+        guard !fileManager.fileExists(atPath: destination.path) else {
+            throw VaultStoreError.alreadyExists
+        }
+
+        var masterKey = try VaultCrypto.unwrapMasterKey(
+            Data(contentsOf: wrappedKeyURL(for: url)), password: password
+        )
+        defer { VaultSession.wipe(&masterKey) }
+
+        let manifestURL = url.appendingPathComponent("vault.manifest")
+        let manifestData = try VaultCrypto.decrypt(Data(contentsOf: manifestURL), using: masterKey)
+        let oldManifest = try JSONDecoder().decode(VaultManifest.self, from: manifestData)
+        let renamedManifest = VaultManifest(
+            version: oldManifest.version, name: safeName, createdAt: oldManifest.createdAt
+        )
+        let encryptedManifest = try VaultCrypto.encrypt(
+            JSONEncoder().encode(renamedManifest), using: masterKey
+        )
+
+        let oldAccount = keychainAccount(for: url)
+        let newAccount = keychainAccount(for: destination)
+        let hasBiometrics = isBiometricUnlockEnabled(for: url)
+        if hasBiometrics {
+            try KeychainStore.save(
+                masterKey, account: newAccount,
+                accessControl: try KeychainStore.makeBiometricAccessControl()
+            )
+        }
+
+        do {
+            try fileManager.moveItem(at: url, to: destination)
+            try encryptedManifest.write(
+                to: destination.appendingPathComponent("vault.manifest"),
+                options: [.atomic, .completeFileProtection]
+            )
+        } catch {
+            if fileManager.fileExists(atPath: destination.path) {
+                try? fileManager.moveItem(at: destination, to: url)
+            }
+            if hasBiometrics { KeychainStore.delete(account: newAccount) }
+            throw error
+        }
+
+        if hasBiometrics { KeychainStore.delete(account: oldAccount) }
+        if let lastAccess = UserDefaults.standard.object(forKey: lastAccessKey(url)) {
+            UserDefaults.standard.set(lastAccess, forKey: lastAccessKey(destination))
+            UserDefaults.standard.removeObject(forKey: lastAccessKey(url))
+        }
+
+        SecurityLog.shared.record(
+            .vaultRenamed, vault: destination.lastPathComponent,
+            detail: "Vault rinominato da «\(url.lastPathComponent)»"
+        )
+        return destination
+    }
+
     /// Elimina il vault (sovrascrittura best effort + rimozione) e la sua chiave Keychain.
     func deleteVault(at url: URL) throws {
 

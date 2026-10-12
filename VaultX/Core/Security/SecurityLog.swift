@@ -18,6 +18,7 @@ struct SecurityEvent: Codable, Identifiable, Equatable {
         case vaultExported
         case vaultImported
         case vaultDuplicated
+        case vaultRenamed
         case vaultDeleted
         case vaultMigrated
         case filesExported
@@ -170,7 +171,7 @@ final class SecurityLog: @unchecked Sendable {
 
         case .unlockFailed, .passwordChanged, .recoveryKeyCreated, .recoveryKeyRemoved,
              .vaultExported, .vaultDeleted, .filesExported, .filesDeleted,
-             .vaultDuplicated, .secureShareCreated:
+             .vaultDuplicated, .vaultRenamed, .secureShareCreated:
             return .notice
 
         default:

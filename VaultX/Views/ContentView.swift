@@ -75,6 +75,7 @@ struct ContentView: View {
     // Sheet
     @State private var unlockTarget: VaultSelection?
     @State private var propertiesTarget: VaultSelection?
+    @State private var renameTarget: VaultSelection?
     @State private var logTarget: LogTarget?
     @State private var showingCreateVault = false
     @State private var showingSettings = false
@@ -326,6 +327,12 @@ struct ContentView: View {
                     }
 
                     Button {
+                        renameTarget = VaultSelection(url: vault)
+                    } label: {
+                        Label("Rinomina…", systemImage: "pencil")
+                    }
+
+                    Button {
                         exportVault(vault)
                     } label: {
                         Label("Esporta…", systemImage: "square.and.arrow.up")
@@ -421,6 +428,13 @@ struct ContentView: View {
 
                     VaultPropertiesView(vaultURL: target.url) {
                         loadVaults()
+                    }
+                }
+
+            Color.clear
+                .sheet(item: $renameTarget) { target in
+                    RenameVaultView(vaultName: target.url.lastPathComponent) { newName, password in
+                        renameVault(target.url, to: newName, password: password)
                     }
                 }
 
@@ -661,6 +675,32 @@ struct ContentView: View {
     }
 
     // MARK: - Vaults
+
+    private func renameVault(_ url: URL, to newName: String, password: String) {
+        renameTarget = nil
+        Task {
+            do {
+                let renamedURL = try await Task.detached(priority: .userInitiated) {
+                    try VaultStore.shared.renameVault(at: url, to: newName, password: password)
+                }.value
+                await MainActor.run {
+                    if activeSession?.vaultURL == url {
+                        activeSession?.lock()
+                        activeSession = nil
+                    }
+                    _ = renamedURL
+                    loadVaults()
+                    infoMessage = "Vault rinominato correttamente."
+                    showingInfo = true
+                }
+            } catch {
+                await MainActor.run {
+                    errorMessage = error.localizedDescription
+                    showingError = true
+                }
+            }
+        }
+    }
 
     private func loadVaults() {
 
@@ -1233,5 +1273,50 @@ private struct VaultRow: View {
         }
 
         return parts.joined(separator: " · ")
+    }
+}
+
+
+// MARK: - Rename vault
+
+private struct RenameVaultView: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var name: String
+    @State private var password = ""
+    let onRename: (String, String) -> Void
+
+    init(vaultName: String, onRename: @escaping (String, String) -> Void) {
+        _name = State(initialValue: vaultName)
+        self.onRename = onRename
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Nome del vault") {
+                    TextField("Nome", text: $name)
+                        .textInputAutocapitalization(.words)
+                        .autocorrectionDisabled()
+                }
+                Section("Conferma di sicurezza") {
+                    SecureField("Password del vault", text: $password)
+                        .textContentType(.password)
+                    Text("La password verifica il vault e permette di aggiornare in sicurezza il nome nel manifest cifrato. I file non vengono ricifrati.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("Rinomina vault")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Annulla") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Salva") { onRename(name, password) }
+                        .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || password.isEmpty)
+                }
+            }
+        }
     }
 }
