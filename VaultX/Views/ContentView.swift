@@ -690,8 +690,6 @@ struct ContentView: View {
                     }
                     _ = renamedURL
                     loadVaults()
-                    infoMessage = "Vault rinominato correttamente."
-                    showingInfo = true
                 }
             } catch {
                 await MainActor.run {
