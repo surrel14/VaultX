@@ -23,6 +23,7 @@ struct VaultItem: Identifiable, Hashable {
     let size: Int64
 
     let modified: Date?
+    let trashedAt: Date?
 
     var id: URL { url }
 
@@ -316,7 +317,8 @@ final class VaultSession: @unchecked Sendable {
             isFolder: node.isFolder,
             name: node.name,
             size: node.size,
-            modified: node.modified
+            modified: node.modified,
+            trashedAt: node.trashedAt
         )
     }
 
@@ -539,7 +541,23 @@ final class VaultSession: @unchecked Sendable {
 
             try Self.requireFolder(parent, in: index)
 
-            return index.children(of: parent).map { makeItem($0) }
+            if let parent, index.isTrashed(parent) {
+                throw VaultStoreError.invalidLocation
+            }
+
+            return index.visibleChildren(of: parent).map { makeItem($0) }
+        }
+    }
+
+    /// Elementi di primo livello nel Cestino. Se una cartella e un suo discendente
+    /// sono stati cestinati in momenti diversi, viene mostrata solo la cartella
+    /// esterna; il contenuto resta recuperabile insieme alla sua struttura.
+    func trashedItems() throws -> [VaultItem] {
+        try withIndex { index in
+            index.nodes.values
+                .filter { $0.trashedAt != nil && !index.hasTrashedAncestor(of: $0.id) }
+                .map { makeItem($0) }
+                .sorted { ($0.trashedAt ?? .distantPast) > ($1.trashedAt ?? .distantPast) }
         }
     }
 
@@ -557,6 +575,10 @@ final class VaultSession: @unchecked Sendable {
         return try mutateIndex { index in
 
             try Self.requireFolder(parent, in: index)
+
+            if let parent, index.isTrashed(parent) {
+                throw VaultStoreError.invalidLocation
+            }
 
             guard !index.nameExists(clean, in: parent) else {
                 throw VaultStoreError.itemAlreadyExists
@@ -594,7 +616,8 @@ final class VaultSession: @unchecked Sendable {
         return try mutateIndex { index in
 
             guard let id = try nodeID(for: item.url),
-                  var node = index.nodes[id]
+                  var node = index.nodes[id],
+                  !index.isTrashed(id)
             else {
                 throw VaultStoreError.invalidLocation
             }
@@ -623,7 +646,8 @@ final class VaultSession: @unchecked Sendable {
     ) throws -> Bool {
 
         guard let id = try nodeID(for: item.url),
-              let node = index.nodes[id]
+              let node = index.nodes[id],
+              !index.isTrashed(id)
         else {
             return false
         }
@@ -632,7 +656,10 @@ final class VaultSession: @unchecked Sendable {
 
         if let target {
 
-            guard let targetNode = index.nodes[target], targetNode.isFolder else {
+            guard let targetNode = index.nodes[target],
+                  targetNode.isFolder,
+                  !index.isTrashed(target)
+            else {
                 return false
             }
         }
@@ -751,12 +778,82 @@ final class VaultSession: @unchecked Sendable {
         return result ?? items
     }
 
+    // MARK: - Trash
+
+    /// Sposta un elemento nel Cestino senza toccare il contenuto cifrato.
+    /// Conserva il genitore originale così il ripristino può ricreare il percorso.
+    func moveItemToTrash(_ item: VaultItem) throws {
+        try mutateIndex { index in
+            guard let id = try nodeID(for: item.url),
+                  var node = index.nodes[id],
+                  !index.isTrashed(id)
+            else {
+                throw VaultStoreError.invalidLocation
+            }
+
+            node.trashedAt = Date()
+            index.nodes[id] = node
+        }
+    }
+
+    /// Sposta più elementi nel Cestino. Gli elementi selezionati dentro una
+    /// cartella selezionata non vengono processati due volte.
+    func moveItemsToTrash(_ items: [VaultItem]) -> [String] {
+        var failures: [String] = []
+
+        for item in topLevel(items) {
+            do {
+                try moveItemToTrash(item)
+            } catch {
+                failures.append("\(item.name): \(error.localizedDescription)")
+            }
+        }
+
+        return failures
+    }
+
+    /// Ripristina un elemento dal Cestino. Se la cartella di origine esiste ed è
+    /// attiva, torna lì; altrimenti viene ripristinato nella radice del vault.
+    /// In caso di conflitto viene assegnato un nome libero automaticamente.
+    func restoreItemFromTrash(_ item: VaultItem) throws {
+        try mutateIndex { index in
+            guard let id = try nodeID(for: item.url),
+                  var node = index.nodes[id],
+                  node.trashedAt != nil,
+                  !index.hasTrashedAncestor(of: id)
+            else {
+                throw VaultStoreError.invalidLocation
+            }
+
+            let originalParent = node.parentID
+            let destinationParent: UUID?
+
+            if let originalParent,
+               let parent = index.nodes[originalParent],
+               parent.isFolder,
+               !index.isTrashed(originalParent) {
+                destinationParent = originalParent
+            } else {
+                destinationParent = nil
+            }
+
+            node.name = index.uniqueName(
+                for: node.name,
+                isFolder: node.isFolder,
+                in: destinationParent
+            )
+            node.parentID = destinationParent
+            node.trashedAt = nil
+            index.nodes[id] = node
+        }
+    }
+
     // MARK: - Delete
 
-    /// Elimina un file o una cartella (con tutto il contenuto). Prima si aggiorna
-    /// l'indice, poi i file cifrati vengono sovrascritti con dati casuali (best
-    /// effort) e rimossi. Se qualcosa si interrompe, i residui vengono ripuliti
-    /// al prossimo sblocco.
+    /// Elimina definitivamente un file o una cartella (con tutto il contenuto).
+    /// Prima si aggiorna l'indice, poi i file cifrati vengono sovrascritti con dati
+    /// casuali (best effort) e rimossi. Se qualcosa si interrompe, i residui
+    /// vengono ripuliti al prossimo sblocco.
     func deleteItem(_ item: VaultItem) throws {
 
         let removedFiles: [UUID] = try mutateIndex { index in
@@ -817,6 +914,9 @@ final class VaultSession: @unchecked Sendable {
 
         try withIndex { index in
             try Self.requireFolder(parent, in: index)
+            if let parent, index.isTrashed(parent) {
+                throw VaultStoreError.invalidLocation
+            }
         }
 
         let key = try makeKey()
@@ -870,6 +970,9 @@ final class VaultSession: @unchecked Sendable {
             try mutateIndex { index in
 
                 try Self.requireFolder(parent, in: index)
+                if let parent, index.isTrashed(parent) {
+                    throw VaultStoreError.invalidLocation
+                }
 
                 let name = index.uniqueName(
                     for: proposedName,

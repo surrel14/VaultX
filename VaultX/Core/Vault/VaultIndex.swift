@@ -18,6 +18,10 @@ struct VaultNode: Codable, Identifiable, Hashable {
 
     var created: Date
     var modified: Date
+
+    /// Data in cui il nodo è stato spostato nel Cestino; nil = elemento attivo.
+    /// È opzionale per mantenere compatibilità con gli indici cifrati già esistenti.
+    var trashedAt: Date? = nil
 }
 
 /// Indice del vault v3: l'unico posto dove vivono nomi e struttura.
@@ -118,6 +122,41 @@ struct VaultIndex {
         nodes.values.filter { $0.parentID == parent }
     }
 
+    /// `true` se il nodo o uno dei suoi antenati è nel Cestino.
+    func isTrashed(_ id: UUID) -> Bool {
+        nodes[id]?.trashedAt != nil || hasTrashedAncestor(of: id)
+    }
+
+    /// Controlla solo gli antenati, non il nodo stesso.
+    func hasTrashedAncestor(of id: UUID) -> Bool {
+        var current = nodes[id]?.parentID
+        var visited = Set<UUID>()
+
+        while let parentID = current, visited.insert(parentID).inserted {
+            guard let parent = nodes[parentID] else {
+                break
+            }
+
+            if parent.trashedAt != nil {
+                return true
+            }
+
+            current = parent.parentID
+        }
+
+        return false
+    }
+
+    /// Figli utilizzabili nella normale navigazione. Gli elementi nel Cestino e
+    /// quelli contenuti in una cartella nel Cestino restano nascosti.
+    func visibleChildren(of parent: UUID?) -> [VaultNode] {
+        if let parent, isTrashed(parent) {
+            return []
+        }
+
+        return children(of: parent).filter { !isTrashed($0.id) }
+    }
+
     /// `true` se `id` sta (a qualsiasi profondità) dentro `ancestor`.
     func isDescendant(_ id: UUID, of ancestor: UUID) -> Bool {
 
@@ -161,7 +200,7 @@ struct VaultIndex {
         excluding excluded: UUID? = nil
     ) -> Bool {
 
-        children(of: parent).contains { node in
+        visibleChildren(of: parent).contains { node in
 
             if node.id == excluded {
                 return false

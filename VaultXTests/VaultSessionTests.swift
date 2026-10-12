@@ -206,6 +206,96 @@ final class VaultSessionTests: XCTestCase {
         XCTAssertTrue(remaining.isEmpty)
     }
 
+    func testIndexDecodesAnIndexCreatedBeforeTrashSupport() throws {
+        let id = UUID().uuidString
+        let oldIndex = """
+        {"version":1,"nodes":[{"id":"\(id)","parentID":null,"name":"esistente.txt","isFolder":false,"size":12,"created":"2026-01-01T00:00:00Z","modified":"2026-01-01T00:00:00Z"}]}
+        """
+
+        let index = try VaultIndex(serialized: Data(oldIndex.utf8))
+        let node = try XCTUnwrap(index.nodes[UUID(uuidString: id)!])
+        XCTAssertNil(node.trashedAt)
+        XCTAssertFalse(index.isTrashed(node.id))
+    }
+
+    func testTrashAndRestoreFilePreservesEncryptedContent() throws {
+        let expected = "contenuto recuperabile"
+        let source = try makeSourceFile(named: "recuperabile.txt", contents: expected)
+        try session.importFile(at: source, into: session.rootDirectory)
+
+        let original = try XCTUnwrap(
+            session.items(in: session.rootDirectory).first { $0.name == "recuperabile.txt" }
+        )
+        let encryptedURL = original.url
+        XCTAssertTrue(FileManager.default.fileExists(atPath: encryptedURL.path))
+
+        XCTAssertTrue(session.moveItemsToTrash([original]).isEmpty)
+        XCTAssertTrue(try session.items(in: session.rootDirectory).isEmpty)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: encryptedURL.path))
+
+        let trashed = try XCTUnwrap(session.trashedItems().first)
+        XCTAssertEqual(trashed.name, "recuperabile.txt")
+        XCTAssertNotNil(trashed.trashedAt)
+
+        try session.restoreItemFromTrash(trashed)
+        let restored = try XCTUnwrap(
+            session.items(in: session.rootDirectory).first { $0.name == "recuperabile.txt" }
+        )
+        let decryptedURL = try session.decryptToTemporaryFile(restored.url)
+        defer { try? SecureDelete.remove(at: decryptedURL) }
+
+        XCTAssertEqual(
+            try String(contentsOf: decryptedURL, encoding: .utf8),
+            expected
+        )
+        XCTAssertTrue(try session.trashedItems().isEmpty)
+    }
+
+    func testTrashAndRestoreFolderKeepsNestedFiles() throws {
+        let folderURL = try session.createFolder(
+            named: "Cartella recuperabile",
+            in: session.rootDirectory
+        )
+        let source = try makeSourceFile(named: "interno.txt", contents: "dentro")
+        try session.importFile(at: source, into: folderURL)
+
+        let folder = try XCTUnwrap(
+            session.items(in: session.rootDirectory).first { $0.name == "Cartella recuperabile" }
+        )
+        XCTAssertTrue(session.moveItemsToTrash([folder]).isEmpty)
+        XCTAssertTrue(try session.items(in: session.rootDirectory).isEmpty)
+
+        let trashedFolder = try XCTUnwrap(session.trashedItems().first)
+        XCTAssertTrue(trashedFolder.isFolder)
+        try session.restoreItemFromTrash(trashedFolder)
+
+        let restoredFolder = try XCTUnwrap(
+            session.items(in: session.rootDirectory).first { $0.name == "Cartella recuperabile" }
+        )
+        let restoredFile = try XCTUnwrap(session.items(in: restoredFolder.url).first)
+        let decryptedURL = try session.decryptToTemporaryFile(restoredFile.url)
+        defer { try? SecureDelete.remove(at: decryptedURL) }
+        XCTAssertEqual(try String(contentsOf: decryptedURL, encoding: .utf8), "dentro")
+    }
+
+    func testTrashedNameCanBeReusedAndPermanentDeleteRemovesCiphertext() throws {
+        let firstSource = try makeSourceFile(named: "duplicato.txt", contents: "primo")
+        try session.importFile(at: firstSource, into: session.rootDirectory)
+        let first = try XCTUnwrap(session.items(in: session.rootDirectory).first)
+        let encryptedURL = first.url
+        XCTAssertTrue(session.moveItemsToTrash([first]).isEmpty)
+
+        let secondSource = try makeSourceFile(named: "duplicato.txt", contents: "secondo")
+        try session.importFile(at: secondSource, into: session.rootDirectory)
+        let visible = try session.items(in: session.rootDirectory)
+        XCTAssertEqual(visible.filter { $0.name == "duplicato.txt" }.count, 1)
+
+        let trashed = try XCTUnwrap(session.trashedItems().first)
+        try session.deleteItem(trashed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: encryptedURL.path))
+        XCTAssertTrue(try session.trashedItems().isEmpty)
+    }
+
     // MARK: - Bulk operations
 
     func testBulkMoveSkipsItemsAlreadyInDestination() throws {
