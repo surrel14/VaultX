@@ -2181,6 +2181,14 @@ private struct AdvancedSearchView: View {
 
                 Section {
                     Button {
+                        // Chiude anche la tastiera numerica (decimalPad), che non ha
+                        // un pulsante Invio/Fine, prima di aggiornare i risultati.
+                        UIApplication.shared.sendAction(
+                            #selector(UIResponder.resignFirstResponder),
+                            to: nil,
+                            from: nil,
+                            for: nil
+                        )
                         performSearch()
                     } label: {
                         HStack {
