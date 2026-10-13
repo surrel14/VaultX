@@ -737,8 +737,18 @@ struct VaultBrowserView: View {
                 }
 
             Color.clear
-                .sheet(isPresented: $showingTagManager) {
-                    TagManagerView(session: session)
+                .sheet(isPresented: $showingTagManager, onDismiss: {
+                    // Ricarica la lista anche quando il gestore viene chiuso,
+                    // così la UI non conserva i tag precedenti in memoria.
+                    loadItems()
+                    selectedTag = nil
+                }) {
+                    TagManagerView(session: session) {
+                        // Aggiornamento immediato dopo rinomina/eliminazione,
+                        // senza dover chiudere e riaprire il vault.
+                        loadItems()
+                        selectedTag = nil
+                    }
                 }
 
             Color.clear
@@ -1985,6 +1995,7 @@ private struct TagFlowLayout: Layout {
 // MARK: - Centralized tag manager
 private struct TagManagerView: View {
     let session: VaultSession
+    let onTagsChanged: () -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var summaries: [VaultSession.TagSummary] = []
     @State private var selectedTag: VaultSession.TagSummary?
@@ -2065,13 +2076,27 @@ private struct TagManagerView: View {
 
     private func renameTag() {
         guard let target = renameTarget else { return }
-        do { try session.renameTag(target.name, to: renameDraft); renameTarget = nil; reload() }
-        catch { errorMessage = error.localizedDescription; showingError = true }
+        do {
+            try session.renameTag(target.name, to: renameDraft)
+            renameTarget = nil
+            reload()
+            onTagsChanged()
+        } catch {
+            errorMessage = error.localizedDescription
+            showingError = true
+        }
     }
 
     private func deleteTag() {
         guard let target = deleteTarget else { return }
-        do { try session.deleteTag(target.name); deleteTarget = nil; reload() }
-        catch { errorMessage = error.localizedDescription; showingError = true }
+        do {
+            try session.deleteTag(target.name)
+            deleteTarget = nil
+            reload()
+            onTagsChanged()
+        } catch {
+            errorMessage = error.localizedDescription
+            showingError = true
+        }
     }
 }
