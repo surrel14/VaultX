@@ -124,6 +124,7 @@ struct VaultBrowserView: View {
     @State private var showingLog = false
     @State private var showingTrash = false
     @State private var showingFavorites = false
+    @State private var returnToFavoritesAfterPreview = false
     @State private var showingTagManager = false
     @State private var showingAdvancedSearch = false
     @State private var itemForTagEditing: VaultItem?
@@ -192,6 +193,12 @@ struct VaultBrowserView: View {
             .onChange(of: previewURL) { newValue in
                 if newValue == nil {
                     scheduleTemporaryCleanup()
+                    if returnToFavoritesAfterPreview {
+                        returnToFavoritesAfterPreview = false
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                            showingFavorites = true
+                        }
+                    }
                 }
             }
             .onChange(of: shareItem?.id) { newValue in
@@ -534,18 +541,11 @@ struct VaultBrowserView: View {
             }
 
             if CameraPicker.isAvailable {
-
                 Button {
                     startCamera()
                 } label: {
                     Label("Scatta foto", systemImage: "camera")
                 }
-            }
-
-            Button {
-                showingPackagePicker = true
-            } label: {
-                Label("Importa pacchetto protetto…", systemImage: "shippingbox")
             }
 
             Button {
@@ -555,15 +555,15 @@ struct VaultBrowserView: View {
             }
 
             Button {
-                showingTrash = true
+                showingPackagePicker = true
             } label: {
-                Label("Cestino", systemImage: "trash")
+                Label("Importa pacchetto protetto", systemImage: "shippingbox")
             }
 
             Button {
                 showingFavorites = true
             } label: {
-                Label("Preferiti e accesso rapido", systemImage: "star.fill")
+                Label("Preferiti", systemImage: "star.fill")
             }
 
             if !allAvailableTags.isEmpty {
@@ -585,15 +585,21 @@ struct VaultBrowserView: View {
             }
 
             Button {
-                showingAdvancedSearch = true
+                showingTagManager = true
             } label: {
-                Label("Ricerca avanzata…", systemImage: "line.3.horizontal.decrease.circle")
+                Label("Gestisci tag", systemImage: "tags")
             }
 
             Button {
-                showingTagManager = true
+                showingAdvancedSearch = true
             } label: {
-                Label("Gestisci tutti i tag…", systemImage: "tags")
+                Label("Ricerca avanzata", systemImage: "line.3.horizontal.decrease.circle")
+            }
+
+            Button {
+                showingTrash = true
+            } label: {
+                Label("Cestino", systemImage: "trash")
             }
 
             Divider()
@@ -786,6 +792,7 @@ struct VaultBrowserView: View {
                     loadItems()
                 }) {
                     FavoritesView(session: session, onOpenFile: { item in
+                        returnToFavoritesAfterPreview = true
                         showingFavorites = false
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
                             openItem(item)
@@ -2416,6 +2423,8 @@ private struct AdvancedSearchView: View {
     }
 
     private func performSearch() {
+        // Chiude anche la tastiera numerica (.decimalPad), che non espone un tasto Fine.
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
         searching = true
         do {
             let minBytes = try parseSize(minimumSize, label: "dimensione minima")
