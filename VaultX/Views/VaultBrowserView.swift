@@ -1882,7 +1882,7 @@ private struct TagEditorView: View {
 
                 if !parsedTags.isEmpty {
                     Section("Anteprima") {
-                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 90), alignment: .leading)], alignment: .leading, spacing: 8) {
+                        TagFlowLayout(spacing: 8) {
                             ForEach(Array(parsedTags.prefix(20).enumerated()), id: \.offset) { _, tag in
                                 Text(String(tag.prefix(32)))
                                     .font(.caption.weight(.medium))
@@ -1917,6 +1917,54 @@ private struct TagEditorView: View {
                     }
                 }
             }
+        }
+    }
+}
+
+
+// MARK: - Compact wrapping layout for tag chips
+
+/// Keeps tag chips close together and wraps to the next line only when needed.
+private struct TagFlowLayout: Layout {
+    var spacing: CGFloat = 8
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let availableWidth = proposal.width ?? 320
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var lineHeight: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if x > 0 && x + size.width > availableWidth {
+                x = 0
+                y += lineHeight + spacing
+                lineHeight = 0
+            }
+            lineHeight = max(lineHeight, size.height)
+            x += size.width + (x == 0 ? 0 : spacing)
+        }
+        return CGSize(width: availableWidth, height: y + lineHeight)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX
+        var y = bounds.minY
+        var lineHeight: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if x > bounds.minX && x + size.width > bounds.maxX {
+                x = bounds.minX
+                y += lineHeight + spacing
+                lineHeight = 0
+            }
+            subview.place(
+                at: CGPoint(x: x, y: y),
+                proposal: ProposedViewSize(width: size.width, height: size.height)
+            )
+            x += size.width + spacing
+            lineHeight = max(lineHeight, size.height)
         }
     }
 }
