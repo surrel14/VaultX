@@ -92,6 +92,10 @@ struct VaultBrowserView: View {
 
     let onLock: () -> Void
 
+    /// Permette alla scorciatoia dalla schermata principale di aprire direttamente il Cestino.
+    var openTrashOnAppear: Bool = false
+    var onTrashOpened: () -> Void = {}
+
     @AppStorage("browser.sortField")
     private var sortFieldRaw = SortField.name.rawValue
 
@@ -118,6 +122,7 @@ struct VaultBrowserView: View {
     @State private var showingChangePassword = false
     @State private var showingRecovery = false
     @State private var showingLog = false
+    @State private var showingTrash = false
     @State private var secureShareItem: VaultItem?
     @State private var showingPackagePicker = false
     @State private var packageToOpen: IdentifiedURL?
@@ -168,6 +173,10 @@ struct VaultBrowserView: View {
                 loadItems()
                 biometricsEnabled = VaultStore.shared
                     .isBiometricUnlockEnabled(for: session.vaultURL)
+                if openTrashOnAppear {
+                    showingTrash = true
+                    onTrashOpened()
+                }
             }
             .onChange(of: reloadToken) { _ in
                 loadItems()
@@ -528,6 +537,12 @@ struct VaultBrowserView: View {
                 Label("Nuova cartella", systemImage: "folder.badge.plus")
             }
 
+            Button {
+                showingTrash = true
+            } label: {
+                Label("Cestino", systemImage: "trash")
+            }
+
             Divider()
 
             Button {
@@ -681,6 +696,13 @@ struct VaultBrowserView: View {
                 }
 
             Color.clear
+                .sheet(isPresented: $showingTrash) {
+                    TrashView(session: session) {
+                        loadItems()
+                    }
+                }
+
+            Color.clear
                 .sheet(isPresented: $showingPackagePicker) {
 
                     VaultDocumentPicker(
@@ -745,7 +767,7 @@ struct VaultBrowserView: View {
                     isPresented: $showingDeleteConfirm
                 ) {
 
-                    Button("Elimina", role: .destructive) {
+                    Button("Sposta nel Cestino", role: .destructive) {
                         performDelete()
                     }
 
@@ -1167,6 +1189,7 @@ struct VaultBrowserView: View {
             || showingPackagePicker
             || showingPhotoPicker
             || showingCamera
+            || showingTrash
             || previewURL != nil
             || shareItem != nil
             || moveRequest != nil
@@ -1225,10 +1248,10 @@ struct VaultBrowserView: View {
     private var deleteTitle: String {
 
         if deletionCandidates.count == 1, let item = deletionCandidates.first {
-            return "Eliminare «\(item.name)»?"
+            return "Spostare «\(item.name)» nel Cestino?"
         }
 
-        return "Eliminare \(deletionCandidates.count) elementi?"
+        return "Spostare \(deletionCandidates.count) elementi nel Cestino?"
     }
 
     private var deleteMessage: String {
@@ -1236,13 +1259,13 @@ struct VaultBrowserView: View {
         if deletionCandidates.count == 1, let item = deletionCandidates.first {
 
             if item.isFolder {
-                return "La cartella e tutto il suo contenuto verranno eliminati definitivamente. L'operazione non può essere annullata."
+                return "La cartella e tutto il suo contenuto verranno spostati nel Cestino. Potrai ripristinarli o eliminarli definitivamente dal Cestino."
             }
 
-            return "Il file verrà eliminato definitivamente. L'operazione non può essere annullata."
+            return "Il file verrà spostato nel Cestino. Potrai ripristinarlo o eliminarlo definitivamente dal Cestino."
         }
 
-        return "Gli elementi selezionati (e il contenuto delle cartelle) verranno eliminati definitivamente. L'operazione non può essere annullata."
+        return "Gli elementi selezionati e il contenuto delle cartelle verranno spostati nel Cestino. Potrai ripristinarli o eliminarli definitivamente dal Cestino."
     }
 
     private func requestDelete(_ candidates: [VaultItem]) {
@@ -1272,13 +1295,13 @@ struct VaultBrowserView: View {
             let failures = await Task.detached(
                 priority: .userInitiated
             ) {
-                session.deleteItems(candidates)
+                session.moveItemsToTrash(candidates)
             }.value
 
             busyMessage = nil
 
             SecurityLog.shared.record(
-                .filesDeleted,
+                .filesMovedToTrash,
                 vault: session.vaultURL.lastPathComponent,
                 detail: "\(candidates.count) elementi",
                 severity: candidates.count >= 10 ? .warning : .notice
@@ -1291,7 +1314,7 @@ struct VaultBrowserView: View {
             if !failures.isEmpty {
 
                 showError(
-                    "Impossibile eliminare:\n"
+                    "Impossibile spostare nel Cestino:\n"
                     + failures.joined(separator: "\n")
                 )
             }
@@ -1481,6 +1504,285 @@ struct VaultItemRow: View {
 
         default:
             return "doc"
+        }
+    }
+}
+
+
+// MARK: - Trash
+
+/// Gestione del Cestino del vault corrente. Gli elementi restano cifrati su disco.
+private struct TrashView: View {
+
+    let session: VaultSession
+    let onVaultContentChanged: () -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var items: [VaultItem] = []
+    private enum ConfirmationAction {
+        case permanentDelete(VaultItem)
+        case emptyTrash
+    }
+
+    @State private var confirmationAction: ConfirmationAction?
+    @State private var showingConfirmation = false
+    @State private var isWorking = false
+    @State private var errorMessage: String?
+    @State private var showingError = false
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if items.isEmpty {
+                    VStack(spacing: 14) {
+                        Image(systemName: "trash")
+                            .font(.system(size: 48))
+                            .foregroundStyle(.secondary)
+
+                        Text("Cestino vuoto")
+                            .font(.title3.weight(.semibold))
+
+                        Text("Gli elementi che elimini appariranno qui e potranno essere ripristinati.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 28)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    List {
+                        ForEach(items) { item in
+                            row(for: item)
+                        }
+                    }
+                    .listStyle(.insetGrouped)
+                    .refreshable {
+                        loadTrash()
+                    }
+                }
+            }
+            .navigationTitle("Cestino")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Fine") {
+                        dismiss()
+                    }
+                }
+
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Svuota", role: .destructive) {
+                        confirmationAction = .emptyTrash
+                        showingConfirmation = true
+                    }
+                    .disabled(items.isEmpty || isWorking)
+                }
+            }
+            .overlay {
+                if isWorking {
+                    ZStack {
+                        Color.black.opacity(0.20).ignoresSafeArea()
+                        ProgressView("Operazione in corso…")
+                            .padding(20)
+                            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+                    }
+                }
+            }
+            .confirmationDialog(
+                confirmationTitle,
+                isPresented: $showingConfirmation,
+                titleVisibility: .visible
+            ) {
+                switch confirmationAction {
+                case .permanentDelete(let item):
+                    Button("Elimina definitivamente", role: .destructive) {
+                        confirmationAction = nil
+                        permanentlyDelete([item])
+                    }
+                case .emptyTrash:
+                    Button("Svuota il Cestino", role: .destructive) {
+                        confirmationAction = nil
+                        permanentlyDelete(items)
+                    }
+                case .none:
+                    EmptyView()
+                }
+
+                Button("Annulla", role: .cancel) {
+                    confirmationAction = nil
+                }
+            } message: {
+                Text(confirmationMessage)
+            }
+            .alert("Errore", isPresented: $showingError) {
+                Button("OK", role: .cancel) { }
+            } message: {
+                Text(errorMessage ?? "")
+            }
+            .onAppear {
+                loadTrash()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func row(for item: VaultItem) -> some View {
+        HStack(spacing: 14) {
+            Image(systemName: VaultItemRow.symbol(for: item))
+                .font(.title3)
+                .foregroundStyle(item.isFolder ? Color.accentColor : Color.secondary)
+                .frame(width: 44, height: 44)
+                .background(
+                    Color(.secondarySystemBackground),
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                )
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(item.name)
+                    .font(.body)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+
+                Text(trashSubtitle(for: item))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 3)
+        .contentShape(Rectangle())
+        .contextMenu {
+            Button {
+                restore(item)
+            } label: {
+                Label("Ripristina", systemImage: "arrow.uturn.backward")
+            }
+
+            Button(role: .destructive) {
+                confirmationAction = .permanentDelete(item)
+                showingConfirmation = true
+            } label: {
+                Label("Elimina definitivamente", systemImage: "trash.slash")
+            }
+        }
+        .swipeActions(edge: .leading, allowsFullSwipe: false) {
+            Button {
+                restore(item)
+            } label: {
+                Label("Ripristina", systemImage: "arrow.uturn.backward")
+            }
+            .tint(.green)
+        }
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            Button(role: .destructive) {
+                confirmationAction = .permanentDelete(item)
+                showingConfirmation = true
+            } label: {
+                Label("Elimina", systemImage: "trash.slash")
+            }
+        }
+    }
+
+    private var confirmationTitle: String {
+        switch confirmationAction {
+        case .permanentDelete:
+            return "Eliminare definitivamente?"
+        case .emptyTrash:
+            return "Svuotare il Cestino?"
+        case .none:
+            return "Conferma"
+        }
+    }
+
+    private var confirmationMessage: String {
+        switch confirmationAction {
+        case .permanentDelete(let item):
+            return item.isFolder
+                ? "La cartella «\(item.name)» e tutto il suo contenuto verranno eliminati definitivamente."
+                : "Il file «\(item.name)» verrà eliminato definitivamente."
+        case .emptyTrash:
+            return "Tutti gli elementi nel Cestino e il contenuto delle cartelle verranno eliminati definitivamente. Non potrai recuperarli."
+        case .none:
+            return "Il contenuto verrà eliminato definitivamente e non potrà essere recuperato."
+        }
+    }
+
+    private func trashSubtitle(for item: VaultItem) -> String {
+        let typeOrSize = item.isFolder
+            ? "Cartella"
+            : ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file)
+        let date = item.trashedAt?.formatted(date: .abbreviated, time: .shortened)
+            ?? "data non disponibile"
+        return "\(typeOrSize) · Nel Cestino dal \(date)"
+    }
+
+    private func loadTrash() {
+        do {
+            items = try session.trashedItems()
+        } catch {
+            errorMessage = error.localizedDescription
+            showingError = true
+        }
+    }
+
+    private func restore(_ item: VaultItem) {
+        guard !isWorking else { return }
+        isWorking = true
+        let currentSession = session
+
+        Task { @MainActor in
+            do {
+                try await Task.detached(priority: .userInitiated) {
+                    try currentSession.restoreItemFromTrash(item)
+                }.value
+
+                loadTrash()
+                SecurityLog.shared.record(
+                    .filesRestored,
+                    vault: currentSession.vaultURL.lastPathComponent,
+                    detail: "1 elemento ripristinato",
+                    severity: .notice
+                )
+                onVaultContentChanged()
+            } catch {
+                errorMessage = error.localizedDescription
+                showingError = true
+            }
+            isWorking = false
+        }
+    }
+
+    private func permanentlyDelete(_ candidates: [VaultItem]) {
+        guard !candidates.isEmpty, !isWorking else { return }
+        isWorking = true
+        let currentSession = session
+
+        Task { @MainActor in
+            let failures = await Task.detached(priority: .userInitiated) {
+                currentSession.deleteItems(candidates)
+            }.value
+
+            let deletedCount = max(0, candidates.count - failures.count)
+            if deletedCount > 0 {
+                SecurityLog.shared.record(
+                    .filesDeleted,
+                    vault: currentSession.vaultURL.lastPathComponent,
+                    detail: "\(deletedCount) elementi eliminati definitivamente",
+                    severity: deletedCount >= 10 ? .warning : .notice
+                )
+            }
+
+            loadTrash()
+            onVaultContentChanged()
+            isWorking = false
+
+            if !failures.isEmpty {
+                errorMessage = "Impossibile eliminare definitivamente:\n"
+                    + failures.joined(separator: "\n")
+                showingError = true
+            }
         }
     }
 }

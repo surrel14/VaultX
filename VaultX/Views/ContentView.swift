@@ -72,6 +72,11 @@ struct ContentView: View {
     @State private var activeSession: VaultSession?
     @State private var path: [VaultFolder] = []
 
+    // Accesso rapido al Cestino protetto: il vault deve essere sbloccato.
+    @State private var showingProtectedTrashPicker = false
+    @State private var pendingTrashVault: URL?
+    @State private var shouldOpenTrashAfterUnlock = false
+
     // Sheet
     @State private var unlockTarget: VaultSelection?
     @State private var propertiesTarget: VaultSelection?
@@ -198,7 +203,9 @@ struct ContentView: View {
                 directory: session.rootDirectory,
                 title: session.displayName(for: session.rootDirectory),
                 reloadToken: reloadToken,
-                onLock: { lockVault() }
+                onLock: { lockVault() },
+                openTrashOnAppear: shouldOpenTrashAfterUnlock,
+                onTrashOpened: { shouldOpenTrashAfterUnlock = false }
             )
 
         } else {
@@ -231,6 +238,17 @@ struct ContentView: View {
                     Image(systemName: "gearshape")
                 }
                 .accessibilityLabel("Impostazioni")
+            }
+
+            ToolbarItem(placement: .navigationBarTrailing) {
+
+                Button {
+                    showingProtectedTrashPicker = true
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .accessibilityLabel("Cestino protetto")
+                .disabled(vaults.isEmpty)
             }
 
             ToolbarItem(placement: .navigationBarTrailing) {
@@ -392,11 +410,29 @@ struct ContentView: View {
         }
     }
 
+    private func openSelectedVaultTrash() {
+        guard let vault = pendingTrashVault else { return }
+        pendingTrashVault = nil
+        shouldOpenTrashAfterUnlock = true
+        unlockTarget = VaultSelection(url: vault)
+    }
+
     // MARK: - Presentations
 
     private var sheetPresentations: some View {
 
         ZStack {
+
+            Color.clear
+                .sheet(
+                    isPresented: $showingProtectedTrashPicker,
+                    onDismiss: openSelectedVaultTrash
+                ) {
+                    ProtectedTrashVaultPicker(vaults: vaults) { url in
+                        pendingTrashVault = url
+                        showingProtectedTrashPicker = false
+                    }
+                }
 
             Color.clear
                 .sheet(isPresented: $showingCreateVault) {
@@ -1313,6 +1349,74 @@ private struct RenameVaultView: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Salva") { onRename(name, password) }
                         .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || password.isEmpty)
+                }
+            }
+        }
+    }
+}
+
+
+// MARK: - Selettore vault per il Cestino protetto
+
+private struct ProtectedTrashVaultPicker: View {
+
+    let vaults: [URL]
+    let onSelect: (URL) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if vaults.isEmpty {
+                    VStack(spacing: 12) {
+                        Image(systemName: "lock.shield")
+                            .font(.system(size: 42))
+                            .foregroundStyle(.secondary)
+                        Text("Nessun vault")
+                            .font(.headline)
+                        Text("Crea o importa un vault per usare il Cestino protetto.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .padding()
+                } else {
+                    List {
+                        Section {
+                            ForEach(vaults, id: \.self) { vault in
+                                Button {
+                                    onSelect(vault)
+                                } label: {
+                                    Label {
+                                        VStack(alignment: .leading, spacing: 3) {
+                                            Text(vault.lastPathComponent)
+                                                .foregroundStyle(.primary)
+                                            Text("Sblocca per visualizzare gli elementi eliminati")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    } icon: {
+                                        Image(systemName: "lock.fill")
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        } header: {
+                            Text("Scegli un vault")
+                        } footer: {
+                            Text("Il contenuto del Cestino resta cifrato e viene mostrato solo dopo aver sbloccato il vault.")
+                        }
+                    }
+                    .listStyle(.insetGrouped)
+                }
+            }
+            .navigationTitle("Cestino protetto")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Annulla") { dismiss() }
                 }
             }
         }
