@@ -639,6 +639,76 @@ final class VaultSession: @unchecked Sendable {
         return components.reversed().joined(separator: "/")
     }
 
+
+    // MARK: - Advanced search
+
+    struct SearchResult: Identifiable, Hashable {
+        let item: VaultItem
+        let path: String
+        var id: URL { item.url }
+    }
+
+    /// Ricerca globale nell'intero vault, incluse le sottocartelle. I metadati
+    /// vengono letti dall'indice già decifrato; i contenuti dei file non vengono aperti.
+    func searchFiles(
+        query rawQuery: String = "",
+        tag selectedTag: String? = nil,
+        fileType: String = "Tutti",
+        modifiedAfter: Date? = nil,
+        modifiedBefore: Date? = nil,
+        minimumSizeBytes: Int64? = nil,
+        maximumSizeBytes: Int64? = nil,
+        folderPath rawFolderPath: String = ""
+    ) throws -> [SearchResult] {
+        let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        let folderQuery = rawFolderPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedTag = selectedTag?.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+
+        return try withIndex { index in
+            index.nodes.values.compactMap { node -> SearchResult? in
+                guard !node.isFolder, !index.isTrashed(node.id) else { return nil }
+                let item = makeItem(node)
+                let path = Self.displayPath(for: node, in: index)
+                let normalizedPath = path.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+                let normalizedQuery = query.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+                let normalizedName = node.name.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+                let normalizedTags = item.tags.map { $0.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current) }
+
+                if !normalizedQuery.isEmpty && !normalizedName.contains(normalizedQuery)
+                    && !normalizedTags.contains(where: { $0.contains(normalizedQuery) })
+                    && !normalizedPath.contains(normalizedQuery) {
+                    return nil
+                }
+                if let normalizedTag, !normalizedTags.contains(normalizedTag) { return nil }
+                if !Self.matchesFileType(node.name, filter: fileType) { return nil }
+                if let modifiedAfter, node.modified < Calendar.current.startOfDay(for: modifiedAfter) { return nil }
+                if let modifiedBefore {
+                    let end = Calendar.current.date(byAdding: .day, value: 1, to: Calendar.current.startOfDay(for: modifiedBefore)) ?? modifiedBefore
+                    if node.modified >= end { return nil }
+                }
+                if let minimumSizeBytes, node.size < minimumSizeBytes { return nil }
+                if let maximumSizeBytes, node.size > maximumSizeBytes { return nil }
+                if !folderQuery.isEmpty && !normalizedPath.contains(folderQuery.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)) { return nil }
+                return SearchResult(item: item, path: path)
+            }.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+        }
+    }
+
+    private static func matchesFileType(_ name: String, filter: String) -> Bool {
+        if filter == "Tutti" { return true }
+        let ext = (name as NSString).pathExtension.lowercased()
+        switch filter {
+        case "PDF": return ext == "pdf"
+        case "Immagini": return ["jpg", "jpeg", "png", "heic", "heif", "gif", "webp", "tif", "tiff", "bmp"].contains(ext)
+        case "Video": return ["mov", "mp4", "m4v", "avi", "mkv", "webm"].contains(ext)
+        case "Audio": return ["mp3", "m4a", "aac", "wav", "aiff", "flac", "ogg", "caf"].contains(ext)
+        case "Documenti": return ["doc", "docx", "rtf", "txt", "pages", "odt", "xls", "xlsx", "csv", "ppt", "pptx", "key", "numbers"].contains(ext)
+        case "Archivi": return ["zip", "7z", "rar", "tar", "gz", "bz2"].contains(ext)
+        case "Senza estensione": return ext.isEmpty
+        default: return !ext.isEmpty && !["pdf", "jpg", "jpeg", "png", "heic", "heif", "gif", "webp", "tif", "tiff", "bmp", "mov", "mp4", "m4v", "avi", "mkv", "webm", "mp3", "m4a", "aac", "wav", "aiff", "flac", "ogg", "caf", "doc", "docx", "rtf", "txt", "pages", "odt", "xls", "xlsx", "csv", "ppt", "pptx", "key", "numbers", "zip", "7z", "rar", "tar", "gz", "bz2"].contains(ext)
+        }
+    }
+
     /// Rinomina il tag in tutto l'indice cifrato senza modificare i file cifrati.
     func renameTag(_ oldName: String, to rawNewName: String) throws {
         let trimmed = rawNewName.trimmingCharacters(in: .whitespacesAndNewlines)

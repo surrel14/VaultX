@@ -124,6 +124,7 @@ struct VaultBrowserView: View {
     @State private var showingLog = false
     @State private var showingTrash = false
     @State private var showingTagManager = false
+    @State private var showingAdvancedSearch = false
     @State private var itemForTagEditing: VaultItem?
     @State private var selectedTag: String?
     @State private var secureShareItem: VaultItem?
@@ -571,6 +572,12 @@ struct VaultBrowserView: View {
             }
 
             Button {
+                showingAdvancedSearch = true
+            } label: {
+                Label("Ricerca avanzata…", systemImage: "line.3.horizontal.decrease.circle")
+            }
+
+            Button {
                 showingTagManager = true
             } label: {
                 Label("Gestisci tutti i tag…", systemImage: "tags")
@@ -733,6 +740,16 @@ struct VaultBrowserView: View {
                     TagEditorView(item: item) { tags in
                         try session.setTags(tags, for: item)
                         loadItems()
+                    }
+                }
+
+            Color.clear
+                .sheet(isPresented: $showingAdvancedSearch) {
+                    AdvancedSearchView(session: session) { item in
+                        showingAdvancedSearch = false
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+                            openItem(item)
+                        }
                     }
                 }
 
@@ -2097,6 +2114,243 @@ private struct TagManagerView: View {
         } catch {
             errorMessage = error.localizedDescription
             showingError = true
+        }
+    }
+}
+
+
+// MARK: - Advanced search
+private struct AdvancedSearchView: View {
+    let session: VaultSession
+    let onOpen: (VaultItem) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var query = ""
+    @State private var selectedTag = "Tutti i tag"
+    @State private var fileType = "Tutti"
+    @State private var folderPath = ""
+    @State private var useDateRange = false
+    @State private var modifiedAfter = Calendar.current.date(byAdding: .month, value: -1, to: Date()) ?? Date()
+    @State private var modifiedBefore = Date()
+    @State private var minimumSize = ""
+    @State private var maximumSize = ""
+    @State private var tags: [String] = []
+    @State private var results: [VaultSession.SearchResult] = []
+    @State private var hasSearched = false
+    @State private var errorMessage: String?
+    @State private var showingError = false
+    @State private var searching = false
+
+    private let fileTypes = ["Tutti", "PDF", "Immagini", "Video", "Audio", "Documenti", "Archivi", "Senza estensione", "Altri tipi"]
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Contenuto") {
+                    TextField("Nome, percorso o tag", text: $query)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    Picker("Tag", selection: $selectedTag) {
+                        Text("Tutti i tag").tag("Tutti i tag")
+                        ForEach(tags, id: \.self) { tag in Text(tag).tag(tag) }
+                    }
+                    Picker("Tipo di file", selection: $fileType) {
+                        ForEach(fileTypes, id: \.self) { type in Text(type).tag(type) }
+                    }
+                    TextField("Cartella o percorso contiene…", text: $folderPath)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                }
+
+                Section("Data di modifica") {
+                    Toggle("Filtra per data", isOn: $useDateRange)
+                    if useDateRange {
+                        DatePicker("Da", selection: $modifiedAfter, displayedComponents: .date)
+                        DatePicker("A", selection: $modifiedBefore, in: modifiedAfter..., displayedComponents: .date)
+                    }
+                }
+
+                Section("Dimensione (MB)") {
+                    TextField("Minima", text: $minimumSize)
+                        .keyboardType(.decimalPad)
+                    TextField("Massima", text: $maximumSize)
+                        .keyboardType(.decimalPad)
+                    Text("Lascia vuoto un campo per non applicare quel limite.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section {
+                    Button {
+                        performSearch()
+                    } label: {
+                        HStack {
+                            Spacer()
+                            if searching { ProgressView().padding(.trailing, 6) }
+                            Label("Cerca in tutto il vault", systemImage: "magnifyingglass")
+                            Spacer()
+                        }
+                    }
+                    .disabled(searching)
+
+                    if hasSearched {
+                        HStack {
+                            Text("Risultati")
+                            Spacer()
+                            Text("\(results.count)").foregroundStyle(.secondary).monospacedDigit()
+                        }
+                    }
+                }
+
+                if hasSearched {
+                    Section("File trovati") {
+                        if results.isEmpty {
+                            ContentUnavailableSearchFallback()
+                        } else {
+                            ForEach(results) { result in
+                                Button { onOpen(result.item) } label: {
+                                    VStack(alignment: .leading, spacing: 5) {
+                                        HStack(spacing: 8) {
+                                            Image(systemName: icon(for: result.item.fileExtension))
+                                                .foregroundStyle(Color.accentColor)
+                                            Text(result.item.name)
+                                                .font(.body.weight(.medium))
+                                                .foregroundStyle(.primary)
+                                                .lineLimit(2)
+                                            Spacer(minLength: 4)
+                                            Image(systemName: "arrow.up.right.square")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                        Text(result.path)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(2)
+                                        HStack(spacing: 8) {
+                                            Text(ByteCountFormatter.string(fromByteCount: result.item.size, countStyle: .file))
+                                            if let date = result.item.modified {
+                                                Text("·")
+                                                Text(date.formatted(date: .abbreviated, time: .omitted))
+                                            }
+                                        }
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        if !result.item.tags.isEmpty {
+                                            Text(result.item.tags.joined(separator: " · "))
+                                                .font(.caption2)
+                                                .foregroundStyle(Color.accentColor)
+                                                .lineLimit(1)
+                                        }
+                                    }
+                                    .padding(.vertical, 3)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Ricerca avanzata")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Chiudi") { dismiss() }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Azzera") { resetFilters() }
+                }
+            }
+            .alert("Ricerca non riuscita", isPresented: $showingError) {
+                Button("OK", role: .cancel) {}
+            } message: { Text(errorMessage ?? "Si è verificato un errore.") }
+            .onAppear(perform: loadTags)
+        }
+    }
+
+    private func loadTags() {
+        do { tags = try session.tagSummaries().map(\.name) }
+        catch { errorMessage = error.localizedDescription; showingError = true }
+    }
+
+    private func performSearch() {
+        searching = true
+        do {
+            let minBytes = try parseSize(minimumSize, label: "dimensione minima")
+            let maxBytes = try parseSize(maximumSize, label: "dimensione massima")
+            if let minBytes, let maxBytes, minBytes > maxBytes {
+                throw SearchValidationError.invalidRange
+            }
+            results = try session.searchFiles(
+                query: query,
+                tag: selectedTag == "Tutti i tag" ? nil : selectedTag,
+                fileType: fileType,
+                modifiedAfter: useDateRange ? modifiedAfter : nil,
+                modifiedBefore: useDateRange ? modifiedBefore : nil,
+                minimumSizeBytes: minBytes,
+                maximumSizeBytes: maxBytes,
+                folderPath: folderPath
+            )
+            hasSearched = true
+        } catch {
+            errorMessage = error.localizedDescription
+            showingError = true
+        }
+        searching = false
+    }
+
+    private func parseSize(_ raw: String, label: String) throws -> Int64? {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: ",", with: ".")
+        guard !value.isEmpty else { return nil }
+        guard let number = Double(value), number >= 0, number.isFinite, number <= Double(Int64.max) / 1_048_576 else {
+            throw SearchValidationError.invalidSize(label)
+        }
+        return Int64(number * 1_048_576)
+    }
+
+    private func resetFilters() {
+        query = ""
+        selectedTag = "Tutti i tag"
+        fileType = "Tutti"
+        folderPath = ""
+        useDateRange = false
+        modifiedAfter = Calendar.current.date(byAdding: .month, value: -1, to: Date()) ?? Date()
+        modifiedBefore = Date()
+        minimumSize = ""
+        maximumSize = ""
+        results = []
+        hasSearched = false
+    }
+
+    private func icon(for ext: String) -> String {
+        switch ext.lowercased() {
+        case "pdf": return "doc.richtext"
+        case "jpg", "jpeg", "png", "heic", "gif", "webp": return "photo"
+        case "mov", "mp4", "m4v", "avi", "mkv": return "video"
+        case "mp3", "m4a", "wav", "flac", "aac": return "waveform"
+        case "zip", "7z", "rar", "tar", "gz": return "archivebox"
+        default: return "doc"
+        }
+    }
+}
+
+private struct ContentUnavailableSearchFallback: View {
+    var body: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "magnifyingglass").font(.title2).foregroundStyle(.secondary)
+            Text("Nessun file trovato").font(.headline)
+            Text("Prova a modificare o rimuovere alcuni filtri.").font(.caption).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 18)
+    }
+}
+
+private enum SearchValidationError: LocalizedError {
+    case invalidRange
+    case invalidSize(String)
+    var errorDescription: String? {
+        switch self {
+        case .invalidRange: return "La dimensione minima non può superare quella massima."
+        case .invalidSize(let label): return "Inserisci un valore valido per la \(label), in MB."
         }
     }
 }
