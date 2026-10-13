@@ -26,6 +26,10 @@ struct VaultNode: Codable, Identifiable, Hashable {
     /// Tag personalizzati salvati nell’indice cifrato. Opzionale per compatibilità
     /// con gli indici creati dalle versioni precedenti di VaultX.
     var tags: [String]? = nil
+
+    /// Preferito dell'utente, salvato nell'indice cifrato. Opzionale per mantenere
+    /// compatibilità con gli indici creati dalle versioni precedenti di VaultX.
+    var isFavorite: Bool? = nil
 }
 
 /// Indice del vault v3: l'unico posto dove vivono nomi e struttura.

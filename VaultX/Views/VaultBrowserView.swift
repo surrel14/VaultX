@@ -123,6 +123,7 @@ struct VaultBrowserView: View {
     @State private var showingRecovery = false
     @State private var showingLog = false
     @State private var showingTrash = false
+    @State private var showingFavorites = false
     @State private var showingTagManager = false
     @State private var showingAdvancedSearch = false
     @State private var itemForTagEditing: VaultItem?
@@ -360,6 +361,12 @@ struct VaultBrowserView: View {
         }
 
         Button {
+            toggleFavorite(item)
+        } label: {
+            Label(item.isFavorite ? "Rimuovi dai Preferiti" : "Aggiungi ai Preferiti", systemImage: item.isFavorite ? "star.slash" : "star")
+        }
+
+        Button {
             startRename(item)
         } label: {
             Label("Rinomina", systemImage: "pencil")
@@ -551,6 +558,12 @@ struct VaultBrowserView: View {
                 showingTrash = true
             } label: {
                 Label("Cestino", systemImage: "trash")
+            }
+
+            Button {
+                showingFavorites = true
+            } label: {
+                Label("Preferiti e accesso rapido", systemImage: "star.fill")
             }
 
             if !allAvailableTags.isEmpty {
@@ -769,6 +782,18 @@ struct VaultBrowserView: View {
                 }
 
             Color.clear
+                .sheet(isPresented: $showingFavorites, onDismiss: {
+                    loadItems()
+                }) {
+                    FavoritesView(session: session, onOpenFile: { item in
+                        showingFavorites = false
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+                            openItem(item)
+                        }
+                    }, onLock: onLock)
+                }
+
+            Color.clear
                 .sheet(isPresented: $showingTrash) {
                     TrashView(session: session) {
                         loadItems()
@@ -941,6 +966,15 @@ struct VaultBrowserView: View {
         }
 
         return .orderedSame
+    }
+
+    private func toggleFavorite(_ item: VaultItem) {
+        do {
+            try session.setFavorite(!item.isFavorite, for: item)
+            loadItems()
+        } catch {
+            showError("Impossibile aggiornare i Preferiti: \(error.localizedDescription)")
+        }
     }
 
     // MARK: - Load
@@ -1457,10 +1491,18 @@ struct VaultItemRow: View {
 
             VStack(alignment: .leading, spacing: 3) {
 
-                Text(item.name)
-                    .font(.body)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                HStack(spacing: 5) {
+                    Text(item.name)
+                        .font(.body)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    if item.isFavorite {
+                        Image(systemName: "star.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.yellow)
+                            .accessibilityLabel("Preferito")
+                    }
+                }
 
                 Text(subtitle)
                     .font(.caption)
@@ -2010,6 +2052,108 @@ private struct TagFlowLayout: Layout {
 
 
 // MARK: - Centralized tag manager
+private struct FavoritesView: View {
+    let session: VaultSession
+    let onOpenFile: (VaultItem) -> Void
+    let onLock: () -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var items: [VaultItem] = []
+    @State private var errorMessage: String?
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if items.isEmpty {
+                    VStack(spacing: 12) {
+                        Image(systemName: "star")
+                            .font(.system(size: 42))
+                            .foregroundStyle(.secondary)
+                        Text("Nessun preferito")
+                            .font(.headline)
+                        Text("Apri il menu di un file o di una cartella e scegli Aggiungi ai Preferiti.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    .padding()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    List {
+                        ForEach(items) { item in
+                            if item.isFolder {
+                                NavigationLink(value: VaultFolder(url: item.url)) {
+                                    VaultItemRow(item: item, session: session)
+                                }
+                                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                    Button(role: .destructive) { removeFavorite(item) } label: {
+                                        Label("Rimuovi", systemImage: "star.slash")
+                                    }
+                                }
+                            } else {
+                                Button { onOpenFile(item) } label: {
+                                    HStack {
+                                        VaultItemRow(item: item, session: session)
+                                        Spacer(minLength: 4)
+                                        Image(systemName: "arrow.up.right.square")
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                    Button(role: .destructive) { removeFavorite(item) } label: {
+                                        Label("Rimuovi", systemImage: "star.slash")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    .listStyle(.plain)
+                }
+            }
+            .navigationTitle("Preferiti")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Chiudi") { dismiss() }
+                }
+            }
+            .navigationDestination(for: VaultFolder.self) { folder in
+                VaultBrowserView(
+                    session: session,
+                    directory: folder.url,
+                    title: session.displayName(for: folder.url),
+                    reloadToken: UUID(),
+                    onLock: onLock
+                )
+            }
+            .alert("Errore", isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } }
+            )) {
+                Button("OK", role: .cancel) { errorMessage = nil }
+            } message: {
+                Text(errorMessage ?? "")
+            }
+            .onAppear(perform: reload)
+        }
+    }
+
+    private func reload() {
+        do { items = try session.favoriteItems() }
+        catch { errorMessage = error.localizedDescription }
+    }
+
+    private func removeFavorite(_ item: VaultItem) {
+        do {
+            try session.setFavorite(false, for: item)
+            reload()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+}
+
 private struct TagManagerView: View {
     let session: VaultSession
     let onTagsChanged: () -> Void
@@ -2181,14 +2325,6 @@ private struct AdvancedSearchView: View {
 
                 Section {
                     Button {
-                        // Chiude anche la tastiera numerica (decimalPad), che non ha
-                        // un pulsante Invio/Fine, prima di aggiornare i risultati.
-                        UIApplication.shared.sendAction(
-                            #selector(UIResponder.resignFirstResponder),
-                            to: nil,
-                            from: nil,
-                            for: nil
-                        )
                         performSearch()
                     } label: {
                         HStack {

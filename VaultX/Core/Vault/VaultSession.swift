@@ -25,6 +25,7 @@ struct VaultItem: Identifiable, Hashable {
     let modified: Date?
     let trashedAt: Date?
     let tags: [String]
+    let isFavorite: Bool
 
     var id: URL { url }
 
@@ -320,7 +321,8 @@ final class VaultSession: @unchecked Sendable {
             size: node.size,
             modified: node.modified,
             trashedAt: node.trashedAt,
-            tags: node.tags ?? []
+            tags: node.tags ?? [],
+            isFavorite: node.isFavorite ?? false
         )
     }
 
@@ -766,6 +768,28 @@ final class VaultSession: @unchecked Sendable {
             }
 
             node.tags = Array(cleanTags)
+            index.nodes[id] = node
+        }
+    }
+
+    /// Elenco globale dei preferiti attivi, comprese le sottocartelle.
+    func favoriteItems() throws -> [VaultItem] {
+        try withIndex { index in
+            index.nodes.values
+                .filter { ($0.isFavorite ?? false) && !index.isTrashed($0.id) }
+                .map { makeItem($0) }
+                .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        }
+    }
+
+    /// Aggiunge o rimuove un elemento dai preferiti nell'indice cifrato.
+    func setFavorite(_ isFavorite: Bool, for item: VaultItem) throws {
+        try mutateIndex { index in
+            guard let id = try nodeID(for: item.url),
+                  var node = index.nodes[id],
+                  !index.isTrashed(id)
+            else { throw VaultStoreError.invalidLocation }
+            node.isFavorite = isFavorite
             index.nodes[id] = node
         }
     }
