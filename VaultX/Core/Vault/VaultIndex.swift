@@ -22,6 +22,10 @@ struct VaultNode: Codable, Identifiable, Hashable {
     /// Data in cui il nodo è stato spostato nel Cestino; nil = elemento attivo.
     /// È opzionale per mantenere compatibilità con gli indici cifrati già esistenti.
     var trashedAt: Date? = nil
+
+    /// Tag personalizzati salvati nell’indice cifrato. Opzionale per compatibilità
+    /// con gli indici creati dalle versioni precedenti di VaultX.
+    var tags: [String]? = nil
 }
 
 /// Indice del vault v3: l'unico posto dove vivono nomi e struttura.

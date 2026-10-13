@@ -24,6 +24,7 @@ struct VaultItem: Identifiable, Hashable {
 
     let modified: Date?
     let trashedAt: Date?
+    let tags: [String]
 
     var id: URL { url }
 
@@ -318,7 +319,8 @@ final class VaultSession: @unchecked Sendable {
             name: node.name,
             size: node.size,
             modified: node.modified,
-            trashedAt: node.trashedAt
+            trashedAt: node.trashedAt,
+            tags: node.tags ?? []
         )
     }
 
@@ -599,6 +601,34 @@ final class VaultSession: @unchecked Sendable {
             index.nodes[node.id] = node
 
             return url(for: node)
+        }
+    }
+
+    // MARK: - Tags
+
+    /// Sostituisce i tag di un elemento. I tag sono conservati nell’indice cifrato
+    /// del vault; l’operazione non modifica né ricifra il contenuto del file.
+    func setTags(_ rawTags: [String], for item: VaultItem) throws {
+
+        var seen = Set<String>()
+        let cleanTags = rawTags.compactMap { raw -> String? in
+            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty else { return nil }
+            let limited = String(value.prefix(32))
+            let key = limited.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            guard seen.insert(key).inserted else { return nil }
+            return limited
+        }.prefix(20)
+
+        try mutateIndex { index in
+            guard let id = try nodeID(for: item.url),
+                  var node = index.nodes[id]
+            else {
+                throw VaultStoreError.invalidLocation
+            }
+
+            node.tags = Array(cleanTags)
+            index.nodes[id] = node
         }
     }
 

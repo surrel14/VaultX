@@ -123,6 +123,8 @@ struct VaultBrowserView: View {
     @State private var showingRecovery = false
     @State private var showingLog = false
     @State private var showingTrash = false
+    @State private var itemForTagEditing: VaultItem?
+    @State private var selectedTag: String?
     @State private var secureShareItem: VaultItem?
     @State private var showingPackagePicker = false
     @State private var packageToOpen: IdentifiedURL?
@@ -362,6 +364,12 @@ struct VaultBrowserView: View {
         }
 
         Button {
+            itemForTagEditing = item
+        } label: {
+            Label("Gestisci tag…", systemImage: "tag")
+        }
+
+        Button {
             moveRequest = MoveRequest(items: [item])
         } label: {
             Label("Sposta…", systemImage: "folder")
@@ -543,6 +551,24 @@ struct VaultBrowserView: View {
                 Label("Cestino", systemImage: "trash")
             }
 
+            if !allAvailableTags.isEmpty {
+                Menu {
+                    Button("Tutti i file") { selectedTag = nil }
+                    Divider()
+                    ForEach(allAvailableTags, id: \.self) { tag in
+                        Button { selectedTag = tag } label: {
+                            if selectedTag == tag {
+                                Label(tag, systemImage: "checkmark")
+                            } else {
+                                Text(tag)
+                            }
+                        }
+                    }
+                } label: {
+                    Label(selectedTag.map { "Tag: \($0)" } ?? "Filtra per tag", systemImage: "tag")
+                }
+            }
+
             Divider()
 
             Button {
@@ -696,6 +722,14 @@ struct VaultBrowserView: View {
                 }
 
             Color.clear
+                .sheet(item: $itemForTagEditing) { item in
+                    TagEditorView(item: item) { tags in
+                        try session.setTags(tags, for: item)
+                        loadItems()
+                    }
+                }
+
+            Color.clear
                 .sheet(isPresented: $showingTrash) {
                     TrashView(session: session) {
                         loadItems()
@@ -796,13 +830,19 @@ struct VaultBrowserView: View {
         SortField(rawValue: sortFieldRaw) ?? .name
     }
 
+    private var allAvailableTags: [String] {
+        Array(Set(items.flatMap(\.tags))).sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    }
+
     private var visibleItems: [VaultItem] {
 
-        let filtered = searchText.isEmpty
-            ? items
-            : items.filter {
-                $0.name.localizedCaseInsensitiveContains(searchText)
-            }
+        let filtered = items.filter { item in
+            let matchesSearch = searchText.isEmpty
+                || item.name.localizedCaseInsensitiveContains(searchText)
+                || item.tags.contains { $0.localizedCaseInsensitiveContains(searchText) }
+            let matchesTag = selectedTag.map { tag in item.tags.contains(tag) } ?? true
+            return matchesSearch && matchesTag
+        }
 
         return filtered.sorted(by: isOrderedBefore)
     }
@@ -1387,6 +1427,21 @@ struct VaultItemRow: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+
+                if !item.tags.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 5) {
+                            ForEach(item.tags, id: \.self) { tag in
+                                Text(tag)
+                                    .font(.caption2.weight(.medium))
+                                    .padding(.horizontal, 7)
+                                    .padding(.vertical, 3)
+                                    .background(Color.accentColor.opacity(0.13), in: Capsule())
+                                    .foregroundStyle(Color.accentColor)
+                            }
+                        }
+                    }
+                }
             }
 
             Spacer(minLength: 0)
@@ -1782,6 +1837,85 @@ private struct TrashView: View {
                 errorMessage = "Impossibile eliminare definitivamente:\n"
                     + failures.joined(separator: "\n")
                 showingError = true
+            }
+        }
+    }
+}
+
+
+// MARK: - Tag editor
+
+private struct TagEditorView: View {
+
+    let item: VaultItem
+    let onSave: ([String]) throws -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var draft: String
+    @State private var errorMessage: String?
+
+    init(item: VaultItem, onSave: @escaping ([String]) throws -> Void) {
+        self.item = item
+        self.onSave = onSave
+        _draft = State(initialValue: item.tags.joined(separator: ", "))
+    }
+
+    private var parsedTags: [String] {
+        draft.split(separator: ",", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("Lavoro, Importante, Personale", text: $draft, axis: .vertical)
+                        .lineLimit(2...4)
+                        .textInputAutocapitalization(.never)
+                    Text("Separa i tag con una virgola. Massimo 20 tag, 32 caratteri ciascuno.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                } header: {
+                    Text("Tag per \(item.name)")
+                }
+
+                if !parsedTags.isEmpty {
+                    Section("Anteprima") {
+                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 90), alignment: .leading)], alignment: .leading, spacing: 8) {
+                            ForEach(Array(parsedTags.prefix(20).enumerated()), id: \.offset) { _, tag in
+                                Text(String(tag.prefix(32)))
+                                    .font(.caption.weight(.medium))
+                                    .padding(.horizontal, 9)
+                                    .padding(.vertical, 6)
+                                    .background(Color.accentColor.opacity(0.13), in: Capsule())
+                                    .foregroundStyle(Color.accentColor)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+
+                if let errorMessage {
+                    Section { Text(errorMessage).foregroundStyle(.red) }
+                }
+            }
+            .navigationTitle("Gestisci tag")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Annulla") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Salva") {
+                        do {
+                            try onSave(Array(parsedTags.prefix(20)))
+                            dismiss()
+                        } catch {
+                            errorMessage = error.localizedDescription
+                        }
+                    }
+                }
             }
         }
     }

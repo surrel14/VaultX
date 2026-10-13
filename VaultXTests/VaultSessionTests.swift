@@ -361,6 +361,31 @@ final class VaultSessionTests: XCTestCase {
         )
     }
 
+    func testTagsAreSavedAndPersistAfterUnlock() throws {
+
+        let source = try makeSourceFile(named: "Tagged.txt")
+        try session.importFile(at: source, into: session.rootDirectory)
+
+        let item = try XCTUnwrap(
+            session.items(in: session.rootDirectory).first { $0.name == "Tagged.txt" }
+        )
+
+        try session.setTags(["Lavoro", "Importante", " lavoro ", ""], for: item)
+
+        let tagged = try XCTUnwrap(
+            session.items(in: session.rootDirectory).first { $0.name == "Tagged.txt" }
+        )
+        XCTAssertEqual(tagged.tags, ["Lavoro", "Importante"])
+
+        session.lock()
+        session = try store.unlockVault(at: session.vaultURL, password: password)
+
+        let reopened = try XCTUnwrap(
+            session.items(in: session.rootDirectory).first { $0.name == "Tagged.txt" }
+        )
+        XCTAssertEqual(reopened.tags, ["Lavoro", "Importante"])
+    }
+
     func testBiometricUnlockEnabledFlagIsOffByDefault() {
 
         XCTAssertFalse(
