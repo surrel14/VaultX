@@ -124,7 +124,6 @@ struct VaultBrowserView: View {
     @State private var showingLog = false
     @State private var showingTrash = false
     @State private var showingFavorites = false
-    @State private var returnToFavoritesAfterPreview = false
     @State private var showingTagManager = false
     @State private var showingAdvancedSearch = false
     @State private var itemForTagEditing: VaultItem?
@@ -193,12 +192,6 @@ struct VaultBrowserView: View {
             .onChange(of: previewURL) { newValue in
                 if newValue == nil {
                     scheduleTemporaryCleanup()
-                    if returnToFavoritesAfterPreview {
-                        returnToFavoritesAfterPreview = false
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                            showingFavorites = true
-                        }
-                    }
                 }
             }
             .onChange(of: shareItem?.id) { newValue in
@@ -791,13 +784,7 @@ struct VaultBrowserView: View {
                 .sheet(isPresented: $showingFavorites, onDismiss: {
                     loadItems()
                 }) {
-                    FavoritesView(session: session, onOpenFile: { item in
-                        returnToFavoritesAfterPreview = true
-                        showingFavorites = false
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
-                            openItem(item)
-                        }
-                    }, onLock: onLock)
+                    FavoritesView(session: session, onLock: onLock)
                 }
 
             Color.clear
@@ -2061,12 +2048,13 @@ private struct TagFlowLayout: Layout {
 // MARK: - Centralized tag manager
 private struct FavoritesView: View {
     let session: VaultSession
-    let onOpenFile: (VaultItem) -> Void
     let onLock: () -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var items: [VaultItem] = []
     @State private var errorMessage: String?
+    @State private var previewURL: URL?
+    @State private var isOpeningFile = false
 
     var body: some View {
         NavigationStack {
@@ -2098,7 +2086,7 @@ private struct FavoritesView: View {
                                     }
                                 }
                             } else {
-                                Button { onOpenFile(item) } label: {
+                                Button { openFavoriteFile(item) } label: {
                                     HStack {
                                         VaultItemRow(item: item, session: session)
                                         Spacer(minLength: 4)
@@ -2120,6 +2108,24 @@ private struct FavoritesView: View {
             }
             .navigationTitle("Preferiti")
             .navigationBarTitleDisplayMode(.inline)
+            .quickLookPreview($previewURL)
+            .overlay {
+                if isOpeningFile {
+                    ProgressView("Apertura file…")
+                        .padding(20)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+                }
+            }
+            .onChange(of: previewURL) { newValue in
+                InactivityMonitor.shared.setPaused(newValue != nil || isOpeningFile)
+                if newValue == nil {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 20) {
+                        if previewURL == nil && !isOpeningFile {
+                            VaultSession.removeTemporaryFiles()
+                        }
+                    }
+                }
+            }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Chiudi") { dismiss() }
@@ -2149,6 +2155,30 @@ private struct FavoritesView: View {
     private func reload() {
         do { items = try session.favoriteItems() }
         catch { errorMessage = error.localizedDescription }
+    }
+
+    /// Apre il file direttamente da questa schermata, senza chiudere e ricreare
+    /// il foglio Preferiti: Quick Look viene presentato sopra la lista esistente.
+    private func openFavoriteFile(_ item: VaultItem) {
+        guard !isOpeningFile else { return }
+        isOpeningFile = true
+        InactivityMonitor.shared.setPaused(true)
+        let currentSession = session
+        let fileURL = item.url
+
+        Task { @MainActor in
+            do {
+                let decryptedURL = try await Task.detached(priority: .userInitiated) {
+                    try currentSession.decryptToTemporaryFile(fileURL)
+                }.value
+                isOpeningFile = false
+                previewURL = decryptedURL
+            } catch {
+                isOpeningFile = false
+                InactivityMonitor.shared.setPaused(false)
+                errorMessage = "Impossibile aprire il file: " + error.localizedDescription
+            }
+        }
     }
 
     private func removeFavorite(_ item: VaultItem) {
