@@ -606,6 +606,74 @@ final class VaultSession: @unchecked Sendable {
 
     // MARK: - Tags
 
+    struct TagSummary: Identifiable, Hashable {
+        let name: String
+        let fileCount: Int
+        let filePaths: [String]
+        var id: String { name }
+    }
+
+    /// Elenco globale dei tag e dei file attivi associati, incluse le sottocartelle.
+    func tagSummaries() throws -> [TagSummary] {
+        try withIndex { index in
+            var grouped: [String: [String]] = [:]
+            for node in index.nodes.values where !node.isFolder && !index.isTrashed(node.id) {
+                for tag in node.tags ?? [] {
+                    grouped[tag, default: []].append(Self.displayPath(for: node, in: index))
+                }
+            }
+            return grouped.map { name, paths in
+                TagSummary(name: name, fileCount: paths.count, filePaths: paths.sorted { $0.localizedStandardCompare($1) == .orderedAscending })
+            }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        }
+    }
+
+    private static func displayPath(for node: VaultNode, in index: VaultIndex) -> String {
+        var components = [node.name]
+        var current = node.parentID
+        var visited = Set<UUID>()
+        while let id = current, visited.insert(id).inserted, let parent = index.nodes[id] {
+            components.append(parent.name)
+            current = parent.parentID
+        }
+        return components.reversed().joined(separator: "/")
+    }
+
+    /// Rinomina il tag in tutto l'indice cifrato senza modificare i file cifrati.
+    func renameTag(_ oldName: String, to rawNewName: String) throws {
+        let trimmed = rawNewName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw VaultStoreError.invalidName }
+        let newName = String(trimmed.prefix(32))
+        let keyFor: (String) -> String = { $0.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current) }
+        let oldKey = keyFor(oldName), newKey = keyFor(newName)
+        try mutateIndex { index in
+            let exists = index.nodes.values.contains { node in (node.tags ?? []).contains { keyFor($0) == newKey } }
+            guard oldKey == newKey || !exists else { throw VaultStoreError.itemAlreadyExists }
+            for (id, var node) in Array(index.nodes) {
+                guard let tags = node.tags else { continue }
+                var changed = false
+                node.tags = tags.map { tag in
+                    guard keyFor(tag) == oldKey else { return tag }
+                    changed = true
+                    return newName
+                }
+                if changed { index.nodes[id] = node }
+            }
+        }
+    }
+
+    /// Rimuove il tag da tutti i nodi senza eliminare alcun file.
+    func deleteTag(_ tagName: String) throws {
+        let key = tagName.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        try mutateIndex { index in
+            for (id, var node) in Array(index.nodes) {
+                guard let tags = node.tags else { continue }
+                let filtered = tags.filter { $0.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current) != key }
+                if filtered.count != tags.count { node.tags = filtered; index.nodes[id] = node }
+            }
+        }
+    }
+
     /// Sostituisce i tag di un elemento. I tag sono conservati nell’indice cifrato
     /// del vault; l’operazione non modifica né ricifra il contenuto del file.
     func setTags(_ rawTags: [String], for item: VaultItem) throws {

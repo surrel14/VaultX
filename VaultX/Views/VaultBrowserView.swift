@@ -123,6 +123,7 @@ struct VaultBrowserView: View {
     @State private var showingRecovery = false
     @State private var showingLog = false
     @State private var showingTrash = false
+    @State private var showingTagManager = false
     @State private var itemForTagEditing: VaultItem?
     @State private var selectedTag: String?
     @State private var secureShareItem: VaultItem?
@@ -569,6 +570,12 @@ struct VaultBrowserView: View {
                 }
             }
 
+            Button {
+                showingTagManager = true
+            } label: {
+                Label("Gestisci tutti i tag…", systemImage: "tags")
+            }
+
             Divider()
 
             Button {
@@ -727,6 +734,11 @@ struct VaultBrowserView: View {
                         try session.setTags(tags, for: item)
                         loadItems()
                     }
+                }
+
+            Color.clear
+                .sheet(isPresented: $showingTagManager) {
+                    TagManagerView(session: session)
                 }
 
             Color.clear
@@ -1966,5 +1978,100 @@ private struct TagFlowLayout: Layout {
             x += size.width + spacing
             lineHeight = max(lineHeight, size.height)
         }
+    }
+}
+
+
+// MARK: - Centralized tag manager
+private struct TagManagerView: View {
+    let session: VaultSession
+    @Environment(\.dismiss) private var dismiss
+    @State private var summaries: [VaultSession.TagSummary] = []
+    @State private var selectedTag: VaultSession.TagSummary?
+    @State private var renameTarget: VaultSession.TagSummary?
+    @State private var renameDraft = ""
+    @State private var deleteTarget: VaultSession.TagSummary?
+    @State private var errorMessage: String?
+    @State private var showingError = false
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if summaries.isEmpty {
+                    VStack(spacing: 12) {
+                        Image(systemName: "tag").font(.largeTitle).foregroundStyle(.secondary)
+                        Text("Nessun tag").font(.headline)
+                        Text("Aggiungi tag ai file dal loro menu contestuale.").font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                    }.padding()
+                } else {
+                    List {
+                        ForEach(summaries) { summary in
+                            Button { selectedTag = summary } label: {
+                                HStack(spacing: 12) {
+                                    Image(systemName: "tag.fill").foregroundStyle(Color.accentColor)
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(summary.name).foregroundStyle(.primary)
+                                        Text("\(summary.fileCount) file").font(.caption).foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    Menu {
+                                        Button { renameTarget = summary; renameDraft = summary.name } label: { Label("Rinomina", systemImage: "pencil") }
+                                        Button(role: .destructive) { deleteTarget = summary } label: { Label("Elimina tag", systemImage: "trash") }
+                                    } label: { Image(systemName: "ellipsis.circle").font(.title3) }
+                                    .buttonStyle(.borderless)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .listStyle(.insetGrouped)
+                }
+            }
+            .navigationTitle("Gestisci tag")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) { Button("Fine") { dismiss() } }
+            }
+            .sheet(item: $selectedTag) { summary in
+                NavigationStack {
+                    List(summary.filePaths, id: \.self) { path in
+                        Label(path, systemImage: "doc")
+                            .font(.body)
+                            .textSelection(.enabled)
+                    }
+                    .navigationTitle(summary.name)
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Fine") { selectedTag = nil } } }
+                }
+            }
+            .alert("Rinomina tag", isPresented: Binding(get: { renameTarget != nil }, set: { if !$0 { renameTarget = nil } })) {
+                TextField("Nome del tag", text: $renameDraft)
+                Button("Annulla", role: .cancel) { renameTarget = nil }
+                Button("Salva") { renameTag() }
+            } message: { Text("Il nuovo nome verrà applicato a tutti i file associati.") }
+            .confirmationDialog("Eliminare il tag «\(deleteTarget?.name ?? "")»?", isPresented: Binding(get: { deleteTarget != nil }, set: { if !$0 { deleteTarget = nil } }), titleVisibility: .visible) {
+                Button("Elimina tag da tutti i file", role: .destructive) { deleteTag() }
+                Button("Annulla", role: .cancel) { deleteTarget = nil }
+            } message: { Text("I file non verranno eliminati.") }
+            .alert("Errore", isPresented: $showingError) { Button("OK", role: .cancel) {} } message: { Text(errorMessage ?? "Operazione non riuscita.") }
+            .onAppear(perform: reload)
+        }
+    }
+
+    private func reload() {
+        do { summaries = try session.tagSummaries() }
+        catch { errorMessage = error.localizedDescription; showingError = true }
+    }
+
+    private func renameTag() {
+        guard let target = renameTarget else { return }
+        do { try session.renameTag(target.name, to: renameDraft); renameTarget = nil; reload() }
+        catch { errorMessage = error.localizedDescription; showingError = true }
+    }
+
+    private func deleteTag() {
+        guard let target = deleteTarget else { return }
+        do { try session.deleteTag(target.name); deleteTarget = nil; reload() }
+        catch { errorMessage = error.localizedDescription; showingError = true }
     }
 }
