@@ -168,6 +168,11 @@ struct VaultBrowserView: View {
             .overlay {
                 busyOverlay
             }
+            // Gesture di blocco: parte dal bordo sinistro e procede verso destra.
+            // L'area stretta evita di interferire con i normali tocchi nella lista.
+            .overlay(alignment: .leading) {
+                leftEdgeLockGesture
+            }
             .background {
                 presentations
             }
@@ -202,6 +207,40 @@ struct VaultBrowserView: View {
             .onChange(of: isExternalUIActive) { active in
                 InactivityMonitor.shared.setPaused(active)
             }
+    }
+
+    /// Intercetta lo swipe dal bordo sinistro verso destra per bloccare il vault.
+    /// La gesture viene ignorata durante selezioni o operazioni/presentazioni attive.
+    private var leftEdgeLockGesture: some View {
+        GeometryReader { geometry in
+            Color.clear
+                .contentShape(Rectangle())
+                .frame(width: min(28, geometry.size.width), height: geometry.size.height)
+                .gesture(
+                    DragGesture(minimumDistance: 18, coordinateSpace: .local)
+                        .onEnded { value in
+                            let horizontal = value.translation.width
+                            let vertical = value.translation.height
+
+                            guard !isSelecting,
+                                  busyMessage == nil,
+                                  !showingImporter,
+                                  !showingPhotoPicker,
+                                  !showingCamera,
+                                  previewURL == nil,
+                                  shareItem == nil,
+                                  moveRequest == nil,
+                                  horizontal > 90,
+                                  abs(vertical) < 70 else {
+                                return
+                            }
+
+                            onLock()
+                        }
+                )
+                .accessibilityHidden(true)
+        }
+        .allowsHitTesting(true)
     }
 
     // MARK: - Content
