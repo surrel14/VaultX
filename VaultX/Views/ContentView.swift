@@ -128,7 +128,12 @@ struct ContentView: View {
                             directory: folder.url,
                             title: session.displayName(for: folder.url),
                             reloadToken: reloadToken,
-                            onLock: { lockVault() }
+                            onLock: { lockVault() },
+                            onBack: {
+                                if !path.isEmpty {
+                                    path.removeLast()
+                                }
+                            }
                         )
                     }
                 }

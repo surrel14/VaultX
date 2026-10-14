@@ -91,6 +91,8 @@ struct VaultBrowserView: View {
     let reloadToken: UUID
 
     let onLock: () -> Void
+    /// Torna alla cartella precedente quando viene completato lo swipe personalizzato.
+    var onBack: () -> Void = {}
 
     /// Permette alla scorciatoia dalla schermata principale di aprire direttamente il Cestino.
     var openTrashOnAppear: Bool = false
@@ -144,6 +146,7 @@ struct VaultBrowserView: View {
 
     /// Offset usato per l’animazione dello swipe di blocco.
     @State private var lockSwipeOffset: CGFloat = 0
+    @State private var backSwipeOffset: CGFloat = 0
 
     var body: some View {
 
@@ -209,16 +212,69 @@ struct VaultBrowserView: View {
             // dove non esiste una schermata precedente nella NavigationStack.
             // Nelle sottocartelle lasciamo il bordo completamente a iOS, così
             // la back gesture nativa può seguire il dito senza essere intercettata.
-            .offset(x: isRootDirectory ? lockSwipeOffset : 0)
+            .offset(x: isRootDirectory ? lockSwipeOffset : backSwipeOffset)
             .overlay(alignment: .leading) {
                 if isRootDirectory {
                     leftEdgeLockGesture
+                } else {
+                    leftEdgeBackGesture
                 }
             }
     }
 
     private var isRootDirectory: Bool {
         directory.standardizedFileURL.path == session.rootDirectory.standardizedFileURL.path
+    }
+
+    /// Nelle sottocartelle, gesto di ritorno con soglia più breve di quella
+    /// percepita nella navigazione nativa. La schermata segue il dito e completa
+    /// il ritorno dopo circa il 28% della larghezza (o con uno swipe rapido).
+    private var leftEdgeBackGesture: some View {
+        GeometryReader { geometry in
+            Color.clear
+                .contentShape(Rectangle())
+                .frame(width: min(36, geometry.size.width), height: geometry.size.height)
+                .gesture(
+                    DragGesture(minimumDistance: 5, coordinateSpace: .local)
+                        .onChanged { value in
+                            guard !isSelecting,
+                                  busyMessage == nil,
+                                  previewURL == nil,
+                                  value.translation.width > 0,
+                                  abs(value.translation.height) < 70 else { return }
+                            var transaction = Transaction()
+                            transaction.animation = nil
+                            withTransaction(transaction) {
+                                backSwipeOffset = min(max(value.translation.width, 0), geometry.size.width)
+                            }
+                        }
+                        .onEnded { value in
+                            let threshold = geometry.size.width * 0.28
+                            let validDirection = value.translation.width > 0
+                                && abs(value.translation.height) < 70
+                            let shouldGoBack = validDirection && (
+                                value.translation.width >= threshold
+                                || value.predictedEndTranslation.width >= geometry.size.width * 0.38
+                            )
+
+                            if shouldGoBack {
+                                withAnimation(.easeOut(duration: 0.16)) {
+                                    backSwipeOffset = geometry.size.width
+                                }
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.17) {
+                                    onBack()
+                                    backSwipeOffset = 0
+                                }
+                            } else {
+                                withAnimation(.interactiveSpring(response: 0.28, dampingFraction: 0.86)) {
+                                    backSwipeOffset = 0
+                                }
+                            }
+                        }
+                )
+                .accessibilityHidden(true)
+        }
+        .allowsHitTesting(true)
     }
 
     /// Swipe dal bordo sinistro verso destra per chiudere il vault dalla radice.
@@ -2130,6 +2186,8 @@ private struct TagFlowLayout: Layout {
 private struct FavoritesView: View {
     let session: VaultSession
     let onLock: () -> Void
+    /// Torna alla cartella precedente quando viene completato lo swipe personalizzato.
+    var onBack: () -> Void = {}
 
     @Environment(\.dismiss) private var dismiss
     @State private var items: [VaultItem] = []
