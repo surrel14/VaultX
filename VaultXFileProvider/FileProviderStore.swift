@@ -8,7 +8,7 @@ final class FileProviderStore {
 
     init() {
         guard let container = fm.containerURL(
-            forSecurityApplicationGroupIdentifier: "group.com.example.VaultX"
+            forSecurityApplicationGroupIdentifier: "group.com.surrel14.VaultX"
         ) else {
             fatalError("Unable to access the App Group container.")
         }

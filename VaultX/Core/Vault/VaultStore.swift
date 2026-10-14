@@ -6,7 +6,7 @@ final class VaultStore {
     static let shared = VaultStore()
 
     private let fileManager = FileManager.default
-    private let appGroupIdentifier = "group.com.example.VaultX"
+    private let appGroupIdentifier = "group.com.surrel14.VaultX"
     private let customRootURL: URL?
 
     /// `rootURL` serve solo ai test: permette di usare una cartella temporanea.
@@ -35,11 +35,83 @@ final class VaultStore {
     }
 
     func prepare() throws {
+        // Prima di usare il container condiviso, copia in modo conservativo gli
+        // eventuali vault presenti nel vecchio percorso Application Support/Vaults.
+        // Gli originali non vengono mai eliminati e le cartelle omonime non vengono
+        // sovrascritte. I test con rootURL personalizzato restano isolati.
+        if customRootURL == nil {
+            try migrateLegacyVaultsIfNeeded()
+        }
 
         try fileManager.createDirectory(
             at: rootURL,
             withIntermediateDirectories: true
         )
+    }
+
+    private func migrateLegacyVaultsIfNeeded() throws {
+        guard let sharedContainer = fileManager.containerURL(
+            forSecurityApplicationGroupIdentifier: appGroupIdentifier
+        ) else {
+            // In assenza di un App Group valido, non spostare nulla: rootURL
+            // continuerà a usare il percorso locale di fallback.
+            return
+        }
+
+        let legacyRoot = fileManager.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        )[0].appendingPathComponent("Vaults", isDirectory: true)
+        let sharedRoot = sharedContainer.appendingPathComponent(
+            "Vaults", isDirectory: true
+        )
+
+        guard legacyRoot.standardizedFileURL != sharedRoot.standardizedFileURL,
+              fileManager.fileExists(atPath: legacyRoot.path) else {
+            return
+        }
+
+        try fileManager.createDirectory(
+            at: sharedRoot,
+            withIntermediateDirectories: true
+        )
+
+        let legacyItems = try fileManager.contentsOfDirectory(
+            at: legacyRoot,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )
+
+        for source in legacyItems {
+            let isDirectory = (try? source.resourceValues(
+                forKeys: [.isDirectoryKey]
+            ).isDirectory) == true
+            guard isDirectory else { continue }
+
+            let destination = sharedRoot.appendingPathComponent(
+                source.lastPathComponent,
+                isDirectory: true
+            )
+
+            // Non sovrascrivere mai un vault esistente. In caso di conflitto,
+            // l'originale resta intatto nel percorso legacy per una gestione manuale.
+            guard !fileManager.fileExists(atPath: destination.path) else { continue }
+
+            let staging = sharedRoot.appendingPathComponent(
+                ".vaultx-migration-\(UUID().uuidString)",
+                isDirectory: true
+            )
+
+            do {
+                try fileManager.copyItem(at: source, to: staging)
+                try fileManager.moveItem(at: staging, to: destination)
+            } catch {
+                // Lascia l'originale intatto e rimuovi solo l'eventuale copia
+                // temporanea incompleta creata da questa migrazione.
+                try? fileManager.removeItem(at: staging)
+                throw error
+            }
+        }
     }
 
     // MARK: - Create
