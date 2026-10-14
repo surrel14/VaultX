@@ -142,7 +142,7 @@ struct VaultBrowserView: View {
     @State private var errorMessage: String?
     @State private var showingError = false
 
-    /// Spostamento visivo della schermata durante la gesture di blocco.
+    /// Offset usato per l’animazione dello swipe di blocco.
     @State private var lockSwipeOffset: CGFloat = 0
 
     var body: some View {
@@ -170,11 +170,6 @@ struct VaultBrowserView: View {
             )
             .overlay {
                 busyOverlay
-            }
-            // Gesture di blocco: parte dal bordo sinistro e procede verso destra.
-            // L'area stretta evita di interferire con i normali tocchi nella lista.
-            .overlay(alignment: .leading) {
-                leftEdgeLockGesture
             }
             .background {
                 presentations
@@ -210,69 +205,52 @@ struct VaultBrowserView: View {
             .onChange(of: isExternalUIActive) { active in
                 InactivityMonitor.shared.setPaused(active)
             }
-            // Trasla l'intera schermata (contenuto e barra di navigazione),
-            // così lo swipe sembra chiudere davvero la pagina.
+            // Muove la pagina, ma lascia l’area di riconoscimento del gesto ferma
+            // sul bordo: così il target non scappa sotto il dito durante il drag.
             .offset(x: lockSwipeOffset)
+            .overlay(alignment: .leading) {
+                leftEdgeLockGesture
+            }
     }
 
-    /// Intercetta lo swipe dal bordo sinistro verso destra per bloccare il vault.
-    /// La gesture viene ignorata durante selezioni o operazioni/presentazioni attive.
+    /// Swipe dal bordo sinistro verso destra per chiudere il vault.
+    /// L’overlay resta ancorato al bordo mentre la schermata si sposta.
     private var leftEdgeLockGesture: some View {
         GeometryReader { geometry in
             Color.clear
                 .contentShape(Rectangle())
-                .frame(width: min(28, geometry.size.width), height: geometry.size.height)
+                .frame(width: min(30, geometry.size.width), height: geometry.size.height)
                 .gesture(
-                    DragGesture(minimumDistance: 8, coordinateSpace: .local)
+                    DragGesture(minimumDistance: 12, coordinateSpace: .local)
                         .onChanged { value in
-                            let horizontal = value.translation.width
-                            let vertical = value.translation.height
-
-                            guard !isSelecting,
-                                  busyMessage == nil,
-                                  !showingImporter,
-                                  !showingPhotoPicker,
-                                  !showingCamera,
-                                  previewURL == nil,
-                                  shareItem == nil,
-                                  moveRequest == nil,
-                                  horizontal > 0,
-                                  abs(vertical) < 70 else {
+                            guard canBeginLockSwipe,
+                                  value.translation.width > 0,
+                                  abs(value.translation.height) < 55 else {
                                 return
                             }
 
-                            // Segue il dito senza animazione artificiale.
+                            // Segue il dito senza aggiungere un’animazione concorrente.
                             var transaction = Transaction()
                             transaction.animation = nil
                             withTransaction(transaction) {
-                                lockSwipeOffset = min(horizontal, geometry.size.width)
+                                lockSwipeOffset = min(value.translation.width, geometry.size.width)
                             }
                         }
                         .onEnded { value in
-                            let horizontal = value.translation.width
-                            let vertical = value.translation.height
-                            let canLock = !isSelecting
-                                && busyMessage == nil
-                                && !showingImporter
-                                && !showingPhotoPicker
-                                && !showingCamera
-                                && previewURL == nil
-                                && shareItem == nil
-                                && moveRequest == nil
-                                && horizontal > 90
-                                && abs(vertical) < 70
+                            let shouldLock = canBeginLockSwipe
+                                && value.translation.width > 100
+                                && abs(value.translation.height) < 55
 
-                            if canLock {
-                                // Completa lo scorrimento fino al bordo e poi blocca.
-                                withAnimation(.easeOut(duration: 0.22)) {
+                            if shouldLock {
+                                // Completa il movimento, poi blocca il vault.
+                                withAnimation(.easeOut(duration: 0.24)) {
                                     lockSwipeOffset = geometry.size.width
                                 }
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.23) {
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
                                     onLock()
                                 }
                             } else {
-                                // Uno swipe corto torna dolcemente alla posizione iniziale.
-                                withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) {
+                                withAnimation(.spring(response: 0.30, dampingFraction: 0.88)) {
                                     lockSwipeOffset = 0
                                 }
                             }
@@ -281,6 +259,22 @@ struct VaultBrowserView: View {
                 .accessibilityHidden(true)
         }
         .allowsHitTesting(true)
+    }
+
+    private var canBeginLockSwipe: Bool {
+        !isSelecting
+            && busyMessage == nil
+            && !showingImporter
+            && !showingPhotoPicker
+            && !showingCamera
+            && previewURL == nil
+            && shareItem == nil
+            && moveRequest == nil
+            && !showingTrash
+            && !showingFavorites
+            && !showingTagManager
+            && !showingAdvancedSearch
+            && !showingPackagePicker
     }
 
     // MARK: - Content
