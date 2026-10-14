@@ -205,15 +205,23 @@ struct VaultBrowserView: View {
             .onChange(of: isExternalUIActive) { active in
                 InactivityMonitor.shared.setPaused(active)
             }
-            // Muove la pagina, ma lascia l’area di riconoscimento del gesto ferma
-            // sul bordo: così il target non scappa sotto il dito durante il drag.
-            .offset(x: lockSwipeOffset)
+            // Lo swipe personalizzato serve soltanto nella radice del vault,
+            // dove non esiste una schermata precedente nella NavigationStack.
+            // Nelle sottocartelle lasciamo il bordo completamente a iOS, così
+            // la back gesture nativa può seguire il dito senza essere intercettata.
+            .offset(x: isRootDirectory ? lockSwipeOffset : 0)
             .overlay(alignment: .leading) {
-                leftEdgeLockGesture
+                if isRootDirectory {
+                    leftEdgeLockGesture
+                }
             }
     }
 
-    /// Swipe dal bordo sinistro verso destra per chiudere il vault.
+    private var isRootDirectory: Bool {
+        directory.standardizedFileURL.path == session.rootDirectory.standardizedFileURL.path
+    }
+
+    /// Swipe dal bordo sinistro verso destra per chiudere il vault dalla radice.
     /// L’overlay resta ancorato al bordo mentre la schermata si sposta.
     private var leftEdgeLockGesture: some View {
         GeometryReader { geometry in
@@ -221,7 +229,7 @@ struct VaultBrowserView: View {
                 .contentShape(Rectangle())
                 .frame(width: min(30, geometry.size.width), height: geometry.size.height)
                 .gesture(
-                    DragGesture(minimumDistance: 12, coordinateSpace: .local)
+                    DragGesture(minimumDistance: 6, coordinateSpace: .local)
                         .onChanged { value in
                             guard canBeginLockSwipe,
                                   value.translation.width > 0,
@@ -233,12 +241,12 @@ struct VaultBrowserView: View {
                             var transaction = Transaction()
                             transaction.animation = nil
                             withTransaction(transaction) {
-                                lockSwipeOffset = min(value.translation.width, geometry.size.width)
+                                lockSwipeOffset = min(max(value.translation.width, 0), geometry.size.width)
                             }
                         }
                         .onEnded { value in
                             let shouldLock = canBeginLockSwipe
-                                && value.translation.width > 100
+                                && value.translation.width > 72
                                 && abs(value.translation.height) < 55
 
                             if shouldLock {
